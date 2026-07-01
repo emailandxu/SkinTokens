@@ -15,7 +15,7 @@ from src.rig_package.info.asset import Asset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LATENT_CHECKPOINT = str(REPO_ROOT / "models" / "articulation-xl.ckpt")
+DEFAULT_LATENT_CHECKPOINT = str(REPO_ROOT / "experiments" / "articulation-xl.ckpt")
 MICHELANGELO_ENCODER_CONFIG = {
     "pretrained_path": None,
     "freeze_encoder": False,

@@ -139,46 +139,40 @@ def subtree_similarity(
     return 0.45 * length_sim + 0.45 * shape_sim + 0.10 * size_penalty
 
 
-def order_children_by_similarity(
+def order_children_by_local_similarity(
     joints: np.ndarray,
     children: Sequence[Sequence[int]],
     child_ids: Sequence[int],
+    *,
+    threshold: float = 0.85,
 ) -> List[int]:
     if len(child_ids) <= 2:
         return list(child_ids)
 
-    leaves = [child for child in child_ids if subtree_size(child, children) == 1]
+    ordered = list(child_ids)
+    original_index = {child: idx for idx, child in enumerate(child_ids)}
     non_leaves = [child for child in child_ids if subtree_size(child, children) > 1]
-    if len(non_leaves) <= 1:
-        return non_leaves + leaves
+    pairs = []
+    for i, a in enumerate(non_leaves):
+        for b in non_leaves[i + 1 :]:
+            sim = subtree_similarity(joints, children, a, b)
+            if sim >= threshold and abs(original_index[a] - original_index[b]) > 1:
+                pairs.append((sim, original_index[a], original_index[b], a, b))
 
-    sims = {
-        (a, b): subtree_similarity(joints, children, a, b)
-        for a in non_leaves
-        for b in non_leaves
-        if a != b
-    }
-    seed = max(sims, key=sims.get)
-    ordered = [seed[0], seed[1]]
-    remaining = [child for child in non_leaves if child not in ordered]
+    moved: set[int] = set()
+    for _, _, _, a, b in sorted(pairs, reverse=True):
+        if a in moved or b in moved:
+            continue
+        pos_a = ordered.index(a)
+        pos_b = ordered.index(b)
+        if abs(pos_a - pos_b) <= 1:
+            continue
+        first, second = (a, b) if pos_a < pos_b else (b, a)
+        ordered.remove(second)
+        ordered.insert(ordered.index(first) + 1, second)
+        moved.add(second)
 
-    while remaining:
-        best = None
-        for child in remaining:
-            left_score = sims.get((child, ordered[0]), sims.get((ordered[0], child), 0.0))
-            right_score = sims.get((ordered[-1], child), sims.get((child, ordered[-1]), 0.0))
-            candidate = max(left_score, right_score)
-            if best is None or candidate > best[0]:
-                best = (candidate, child, left_score > right_score)
-        assert best is not None
-        _, child, insert_left = best
-        if insert_left:
-            ordered.insert(0, child)
-        else:
-            ordered.append(child)
-        remaining.remove(child)
-
-    return ordered + leaves
+    return ordered
 
 
 def similar_subtree_order(
@@ -189,7 +183,11 @@ def similar_subtree_order(
     new_children = [list(row) for row in children]
     for node, child_ids in enumerate(children):
         if len(child_ids) > 1:
-            new_children[node] = order_children_by_similarity(joints, children, child_ids)
+            new_children[node] = order_children_by_local_similarity(
+                joints,
+                children,
+                child_ids,
+            )
 
     root = root_from_parents(parents)
     order: List[int] = []

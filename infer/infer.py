@@ -23,40 +23,76 @@ if str(REPO_ROOT) not in sys.path:
 
 os.environ["XFORMERS_IGNORE_FLASH_VERSION_CHECK"] = "1"
 
-from infer_io import (  # noqa: E402
-    apply_affine,
-    build_debug_arrays,
-    fit_affine,
-    load_obj_asset,
-    load_obj_text_vertices,
-    load_rig_txt,
-    write_debug_npz,
-    write_heter_txt,
-    write_skin_with_txt_template,
-)
-from infer_postprocess import (  # noqa: E402
-    DEFAULT_LATENT_CHECKPOINT,
-    LatentSkinSmoother,
-    latent_smooth_options_from_args,
-)
-from infer_rigpatcher import (  # noqa: E402
-    RigSpec,
-    apply_rig,
-    remap_skin_to_rig,
-    reorder_rig_spec,
-    rig_with_joint_order,
-    similar_subtree_order,
-    transformed_rig_from_asset,
-)
-from infer_scoring import (  # noqa: E402
-    generate_output_ids,
-    generation_kwargs_from_args,
-    get_skeleton_tokens_from_batch,
-    print_skeleton_score,
-    print_skin_score,
-    score_generated_skin_tokens,
-    score_skeleton_tokens,
-)
+if __package__:
+    from .infer_io import (  # noqa: E402
+        apply_affine,
+        build_debug_arrays,
+        fit_affine,
+        load_obj_asset,
+        load_obj_text_vertices,
+        load_rig_txt,
+        write_debug_npz,
+        write_heter_txt,
+        write_skin_with_txt_template,
+    )
+    from .infer_postprocess import (  # type: ignore[import-not-found]  # noqa: E402
+        DEFAULT_LATENT_CHECKPOINT,
+        LatentSkinSmoother,
+        latent_smooth_options_from_args,
+    )
+    from .infer_rigpatcher import (  # type: ignore[import-not-found]  # noqa: E402
+        RigSpec,
+        apply_rig,
+        remap_skin_to_rig,
+        reorder_rig_spec,
+        rig_with_joint_order,
+        similar_subtree_order,
+        transformed_rig_from_asset,
+    )
+    from .infer_scoring import (  # type: ignore[import-not-found]  # noqa: E402
+        generate_output_ids,
+        generation_kwargs_from_args,
+        get_skeleton_tokens_from_batch,
+        print_skeleton_score,
+        print_skin_score,
+        score_generated_skin_tokens,
+        score_skeleton_tokens,
+    )
+else:
+    from infer_io import (  # noqa: E402
+        apply_affine,
+        build_debug_arrays,
+        fit_affine,
+        load_obj_asset,
+        load_obj_text_vertices,
+        load_rig_txt,
+        write_debug_npz,
+        write_heter_txt,
+        write_skin_with_txt_template,
+    )
+    from infer_postprocess import (  # noqa: E402
+        DEFAULT_LATENT_CHECKPOINT,
+        LatentSkinSmoother,
+        latent_smooth_options_from_args,
+    )
+    from infer_rigpatcher import (  # noqa: E402
+        RigSpec,
+        apply_rig,
+        remap_skin_to_rig,
+        reorder_rig_spec,
+        rig_with_joint_order,
+        similar_subtree_order,
+        transformed_rig_from_asset,
+    )
+    from infer_scoring import (  # noqa: E402
+        generate_output_ids,
+        generation_kwargs_from_args,
+        get_skeleton_tokens_from_batch,
+        print_skeleton_score,
+        print_skin_score,
+        score_generated_skin_tokens,
+        score_skeleton_tokens,
+    )
 from src.data.transform import Transform  # noqa: E402
 from src.data.vertex_group import voxel_skin  # noqa: E402
 from src.model.spec import ModelInput  # noqa: E402

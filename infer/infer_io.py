@@ -6,7 +6,10 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from torch import Tensor
 
-from infer_rigpatcher import RigSpec
+if __package__:
+    from .infer_rigpatcher import RigSpec
+else:
+    from infer_rigpatcher import RigSpec
 from src.rig_package.info.asset import Asset
 
 

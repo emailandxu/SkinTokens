@@ -99,3 +99,4 @@ coverage.xml
 *.cover
 
 # Project-specific ignores
+examples
