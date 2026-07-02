@@ -157,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reorder-generated-skeleton",
-        default="none",
+        default="similar-subtrees",
         choices=["none", "similar-subtrees"],
         help="For auto mode, reorder generated skeleton siblings before generating skin.",
     )
