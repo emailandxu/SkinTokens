@@ -32,7 +32,7 @@ def build_parser(*, require_input: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--repetition-penalty", type=float, default=2.0)
     parser.add_argument("--num-beams", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None)
