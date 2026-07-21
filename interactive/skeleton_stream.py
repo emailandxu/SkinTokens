@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -14,6 +14,212 @@ from src.tokenizer.tokenizer_part import discretize
 from src.tokenizer.spec import TokenizeInput
 
 from .session import InteractiveSession, SkeletonContext
+
+
+def children_from_parents(parents: Sequence[int]) -> List[List[int]]:
+    children: List[List[int]] = [[] for _ in parents]
+    for child, parent in enumerate(parents):
+        if int(parent) != -1:
+            children[int(parent)].append(child)
+    return children
+
+
+def root_from_parents(parents: Sequence[int]) -> int:
+    roots = [index for index, parent in enumerate(parents) if int(parent) == -1]
+    if len(roots) != 1:
+        raise ValueError(f"expected one root, found {len(roots)}")
+    return roots[0]
+
+
+def subtree_size(node: int, children: Sequence[Sequence[int]]) -> int:
+    return 1 + sum(subtree_size(child, children) for child in children[node])
+
+
+def longest_chain_indices(
+    node: int,
+    children: Sequence[Sequence[int]],
+) -> List[int]:
+    if not children[node]:
+        return [node]
+    chains = [
+        [node] + longest_chain_indices(child, children)
+        for child in children[node]
+    ]
+    return max(chains, key=len)
+
+
+def resample_chain_points(
+    joints: np.ndarray,
+    chain: Sequence[int],
+    samples: int = 16,
+    *,
+    mirror_x: bool = False,
+) -> np.ndarray:
+    points = np.asarray([joints[index] for index in chain], dtype=np.float64)
+    points = points - points[0]
+    if mirror_x:
+        points[:, 0] *= -1.0
+    scale = np.linalg.norm(points[-1])
+    if scale < 1e-9:
+        scale = np.max(np.linalg.norm(points, axis=1))
+    points = points / max(float(scale), 1e-9)
+    if points.shape[0] == 1:
+        return np.repeat(points, samples, axis=0)
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    distances = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total = distances[-1]
+    if total < 1e-9:
+        return np.repeat(points[:1], samples, axis=0)
+
+    result = []
+    for target in np.linspace(0.0, total, samples):
+        segment = np.searchsorted(distances, target, side="right") - 1
+        segment = min(max(segment, 0), len(segment_lengths) - 1)
+        alpha = (target - distances[segment]) / max(
+            float(segment_lengths[segment]),
+            1e-9,
+        )
+        result.append(
+            points[segment] * (1.0 - alpha) + points[segment + 1] * alpha
+        )
+    return np.stack(result)
+
+
+def chain_lengths(joints: np.ndarray, chain: Sequence[int]) -> np.ndarray:
+    return np.asarray(
+        [
+            float(np.linalg.norm(joints[end] - joints[start]))
+            for start, end in zip(chain, chain[1:])
+        ],
+        dtype=np.float64,
+    )
+
+
+def subtree_similarity(
+    joints: np.ndarray,
+    children: Sequence[Sequence[int]],
+    a: int,
+    b: int,
+) -> float:
+    chain_a = longest_chain_indices(a, children)
+    chain_b = longest_chain_indices(b, children)
+    lengths_a = chain_lengths(joints, chain_a)
+    lengths_b = chain_lengths(joints, chain_b)
+    common = min(lengths_a.shape[0], lengths_b.shape[0])
+    if common == 0:
+        length_similarity = 1.0 if lengths_a.shape[0] == lengths_b.shape[0] else 0.0
+    else:
+        relative_error = np.abs(lengths_a[:common] - lengths_b[:common]) / np.maximum(
+            np.maximum(lengths_a[:common], lengths_b[:common]),
+            1e-9,
+        )
+        length_penalty = abs(lengths_a.shape[0] - lengths_b.shape[0]) / max(
+            lengths_a.shape[0],
+            lengths_b.shape[0],
+            1,
+        )
+        length_similarity = float(
+            (1.0 - np.mean(relative_error)) * (1.0 - length_penalty)
+        )
+
+    shape_a = resample_chain_points(joints, chain_a)
+    shape_b = resample_chain_points(joints, chain_b)
+    mirrored_b = resample_chain_points(joints, chain_b, mirror_x=True)
+    shape_distance = min(
+        float(np.sqrt(np.mean(np.sum((shape_a - shape_b) ** 2, axis=1)))),
+        float(np.sqrt(np.mean(np.sum((shape_a - mirrored_b) ** 2, axis=1)))),
+    )
+    shape_similarity = float(np.exp(-shape_distance / 0.5))
+    size_similarity = 1.0 - abs(
+        subtree_size(a, children) - subtree_size(b, children)
+    ) / max(subtree_size(a, children), subtree_size(b, children), 1)
+    return 0.45 * length_similarity + 0.45 * shape_similarity + 0.10 * size_similarity
+
+
+def order_children_by_local_similarity(
+    joints: np.ndarray,
+    children: Sequence[Sequence[int]],
+    child_ids: Sequence[int],
+    *,
+    threshold: float = 0.85,
+) -> List[int]:
+    if len(child_ids) <= 2:
+        return list(child_ids)
+
+    ordered = list(child_ids)
+    original_index = {child: index for index, child in enumerate(child_ids)}
+    non_leaves = [child for child in child_ids if subtree_size(child, children) > 1]
+    pairs = []
+    for position, a in enumerate(non_leaves):
+        for b in non_leaves[position + 1 :]:
+            similarity = subtree_similarity(joints, children, a, b)
+            if similarity >= threshold and abs(original_index[a] - original_index[b]) > 1:
+                pairs.append((similarity, original_index[a], original_index[b], a, b))
+
+    moved: set[int] = set()
+    for _similarity, _index_a, _index_b, a, b in sorted(pairs, reverse=True):
+        if a in moved or b in moved:
+            continue
+        position_a = ordered.index(a)
+        position_b = ordered.index(b)
+        if abs(position_a - position_b) <= 1:
+            continue
+        first, second = (a, b) if position_a < position_b else (b, a)
+        ordered.remove(second)
+        ordered.insert(ordered.index(first) + 1, second)
+        moved.add(second)
+    return ordered
+
+
+def similar_subtree_order(
+    joints: np.ndarray,
+    parents: Sequence[int],
+) -> List[int]:
+    children = children_from_parents(parents)
+    reordered_children = [list(row) for row in children]
+    for node, child_ids in enumerate(children):
+        if len(child_ids) > 1:
+            reordered_children[node] = order_children_by_local_similarity(
+                joints,
+                children,
+                child_ids,
+            )
+
+    order: List[int] = []
+
+    def visit(node: int) -> None:
+        order.append(node)
+        for child in reordered_children[node]:
+            visit(child)
+
+    visit(root_from_parents(parents))
+    if len(order) != len(parents):
+        raise RuntimeError("reordered skeleton did not visit every joint")
+    return order
+
+
+def reorder_skeleton_context(
+    context: SkeletonContext,
+    order: Sequence[int],
+) -> SkeletonContext:
+    old_to_new = {old: new for new, old in enumerate(order)}
+    parents = np.asarray(
+        [
+            -1
+            if int(context.parents[old]) == -1
+            else old_to_new[int(context.parents[old])]
+            for old in order
+        ],
+        dtype=np.int32,
+    )
+    indices = np.asarray(order, dtype=np.int64)
+    return SkeletonContext(
+        joints=context.joints[indices].copy(),
+        parents=parents,
+        joint_names=[context.joint_names[old] for old in order],
+        done=context.done,
+    )
 
 
 class ForceCoordinateStepsProcessor(LogitsProcessor):
@@ -175,6 +381,41 @@ def decode_skeleton_tokens(model, session: InteractiveSession, tokens: np.ndarra
     )
 
 
+def preserve_context_prefix(
+    previous: SkeletonContext,
+    decoded: SkeletonContext,
+) -> SkeletonContext:
+    previous_count = int(previous.joints.shape[0])
+    decoded_count = int(decoded.joints.shape[0])
+    if decoded_count < previous_count:
+        raise RuntimeError(
+            f"decoded skeleton lost existing joints: {decoded_count} < {previous_count}"
+        )
+    if previous_count == 0:
+        return decoded
+    new_parents = decoded.parents[previous_count:].copy()
+    for offset, parent in enumerate(new_parents, start=previous_count):
+        if int(parent) < 0 or int(parent) >= offset:
+            raise RuntimeError(
+                f"generated joint {offset} has invalid parent {int(parent)}"
+            )
+    return SkeletonContext(
+        joints=np.concatenate(
+            [previous.joints, decoded.joints[previous_count:]],
+            axis=0,
+        ),
+        parents=np.concatenate(
+            [previous.parents, new_parents],
+            axis=0,
+        ),
+        joint_names=(
+            list(previous.joint_names)
+            + list(decoded.joint_names[previous_count:])
+        ),
+        done=decoded.done,
+    )
+
+
 @torch.no_grad()
 def generate_next(
     model,
@@ -186,7 +427,6 @@ def generate_next(
     if context.done:
         return context, context_to_tokens(model, session, context)
 
-    prefix_before_branch = start_tokens_without_eos(model, session, context)
     prefix = prefix_with_branch_parent(model, session, context, branch_parent)
     force_child_coordinates = branch_parent is not None and context.joints.shape[0] > 0
     device = session.vertices.device
@@ -217,8 +457,57 @@ def generate_next(
         )
     generated = results[0].detach().cpu().numpy().astype(np.int64)
     next_tokens = trim_to_next_unit(model, prefix=prefix, generated=generated)
-    next_context = decode_skeleton_tokens(model, session, next_tokens)
+    decoded_context = decode_skeleton_tokens(model, session, next_tokens)
+    next_context = preserve_context_prefix(context, decoded_context)
     return next_context, next_tokens
+
+
+@torch.no_grad()
+def generate_rig(
+    model,
+    session: InteractiveSession,
+    context: SkeletonContext,
+    options: GenerationOptions,
+) -> tuple[SkeletonContext, np.ndarray]:
+    if context.done:
+        return context, context_to_tokens(model, session, context)
+
+    prefix = start_tokens_without_eos(model, session, context)
+    device = session.vertices.device
+    start_tokens = torch.as_tensor(prefix, dtype=torch.long, device=device).unsqueeze(0)
+    start_embed = model.transformer.get_input_embeddings()(start_tokens)
+    inputs_embeds = torch.cat([session.learned_mesh_cond, start_embed], dim=1)
+    logits_processor = LogitsProcessorList([
+        VocabSwitchingLogitsProcessor(
+            tokenizer=model.tokenizer,
+            switch_token_id=model.tokenizer.eos,
+            eos_token_id=model.eos,
+            tokens_per_skin=model.tokens_per_skin,
+            init=start_tokens[0],
+        )
+    ])
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        results = model.transformer.generate(
+            inputs_embeds=inputs_embeds,
+            bos_token_id=model.tokenizer.bos,
+            eos_token_id=model.tokenizer.eos,
+            pad_token_id=model.tokenizer.pad,
+            logits_processor=logits_processor,
+            **options.to_generate_kwargs(),
+        )
+    generated = results[0].detach().cpu().numpy().astype(np.int64)
+    eos_positions = np.flatnonzero(generated == model.tokenizer.eos)
+    if eos_positions.size == 0:
+        raise RuntimeError(
+            "rig generation did not reach skeleton EOS within "
+            f"{options.max_new_tokens} tokens"
+        )
+    generated = generated[: int(eos_positions[0]) + 1]
+    rig_tokens = np.concatenate([prefix, generated]).astype(np.int64)
+    decoded_context = decode_skeleton_tokens(model, session, rig_tokens)
+    rig_context = preserve_context_prefix(context, decoded_context)
+    return rig_context, rig_tokens
 
 
 @torch.no_grad()

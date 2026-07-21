@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
+
+
+JOINT_ID_PROP = "skintokens_joint_id"
+PARENT_ID_PROP = "skintokens_parent_id"
+DFS_ORDER_PROP = "skintokens_dfs_order"
+MANAGED_BONE_PROP = "skintokens_managed_bone"
 
 
 def _bpy():
@@ -124,43 +133,89 @@ def armature_for_mesh(mesh_obj):
     return None
 
 
-def parse_armature_object(
-    armature_obj,
-    keep_bone_names: set[str] | None = None,
-) -> tuple[list[list[float]], list[int], list[str]]:
+def armature_by_name(name: str | None):
+    if not name:
+        return None
+    armature_obj = _bpy().data.objects.get(name)
+    if armature_obj is None or armature_obj.type != "ARMATURE":
+        return None
+    return armature_obj
+
+
+def _bone_by_name(collection, bone_name: str):
+    get = getattr(collection, "get", None)
+    if get is not None:
+        return get(bone_name)
+    return next(
+        (bone for bone in collection if str(bone.name) == bone_name),
+        None,
+    )
+
+
+def _pose_bone_selected(armature_obj, bone_name: str) -> bool:
+    data_bone = _bone_by_name(armature_obj.data.bones, bone_name)
+    if data_bone is not None and hasattr(data_bone, "select"):
+        return bool(data_bone.select)
+    pose = getattr(armature_obj, "pose", None)
+    pose_bone = None if pose is None else _bone_by_name(pose.bones, bone_name)
+    return bool(pose_bone is not None and getattr(pose_bone, "select", False))
+
+
+def _set_pose_bone_selected(armature_obj, bone_name: str, selected: bool) -> None:
+    data_bone = _bone_by_name(armature_obj.data.bones, bone_name)
+    if data_bone is not None and hasattr(data_bone, "select"):
+        data_bone.select = bool(selected)
+        return
+    pose = getattr(armature_obj, "pose", None)
+    pose_bone = None if pose is None else _bone_by_name(pose.bones, bone_name)
+    if pose_bone is not None and hasattr(pose_bone, "select"):
+        pose_bone.select = bool(selected)
+
+
+def parse_armature_object(armature_obj) -> tuple[list[list[float]], list[int], list[str]]:
     if armature_obj is None or armature_obj.type != "ARMATURE":
         raise ValueError("mesh has no armature")
 
-    roots = [bone for bone in armature_obj.data.bones if bone.parent is None]
+    source_bones = (
+        list(armature_obj.data.edit_bones)
+        if armature_obj.mode == "EDIT"
+        else list(armature_obj.data.bones)
+    )
+    if not source_bones:
+        return [], [], []
+
+    fallback_order = {bone.name: index for index, bone in enumerate(source_bones)}
+
+    def bone_order(bone) -> int:
+        try:
+            return int(bone.get(DFS_ORDER_PROP, fallback_order[bone.name]))
+        except (AttributeError, TypeError, ValueError):
+            return fallback_order[bone.name]
+
+    roots = [bone for bone in source_bones if bone.parent is None]
     if len(roots) != 1:
         raise ValueError(f"expected one FBX armature root, found {len(roots)}")
 
     ordered_bones = []
+    source_names = {bone.name for bone in source_bones}
 
     def visit(bone) -> None:
         ordered_bones.append(bone)
-        for child in bone.children:
+        children = [child for child in bone.children if child.name in source_names]
+        for child in sorted(children, key=bone_order):
             visit(child)
 
     visit(roots[0])
-    if len(ordered_bones) != len(armature_obj.data.bones):
+    if len(ordered_bones) != len(source_bones):
         raise ValueError("FBX armature has bones disconnected from root")
-
-    if keep_bone_names is not None:
-        keep_bone_names = {str(name) for name in keep_bone_names}
-        root_name = str(roots[0].name)
-        if root_name not in keep_bone_names:
-            keep_bone_names.add(root_name)
-        ordered_bones = [bone for bone in ordered_bones if bone.name in keep_bone_names]
-        if not ordered_bones:
-            raise ValueError("FBX armature has no bones matching mesh vertex groups")
 
     old_to_new = {bone.name: idx for idx, bone in enumerate(ordered_bones)}
     joints = []
     parents = []
     names = []
     for bone in ordered_bones:
-        head = armature_obj.matrix_world @ bone.head_local
+        local_head = bone.head if armature_obj.mode == "EDIT" else bone.head_local
+        head = armature_obj.matrix_world @ local_head
         joints.append([float(head.x), float(head.y), float(head.z)])
         parent = bone.parent
         while parent is not None and parent.name not in old_to_new:
@@ -170,14 +225,458 @@ def parse_armature_object(
     return joints, parents, names
 
 
+def ensure_mesh_armature(
+    mesh_object_name: str,
+    armature_object_name: str | None = None,
+):
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+
+    armature_obj = armature_by_name(armature_object_name)
+    if armature_object_name and armature_obj is None:
+        raise RuntimeError(f"armature object not found: {armature_object_name}")
+    if armature_obj is None:
+        armature_obj = armature_for_mesh(mesh_obj)
+    if armature_obj is None:
+        armature_data = bpy.data.armatures.new(
+            f"{mesh_obj.name}_SkinTokensArmature"
+        )
+        armature_obj = bpy.data.objects.new(armature_data.name, armature_data)
+        bpy.context.scene.collection.objects.link(armature_obj)
+        armature_obj.matrix_world = mesh_obj.matrix_world.copy()
+        armature_obj.show_in_front = True
+
+    modifier = next(
+        (
+            item
+            for item in mesh_obj.modifiers
+            if item.type == "ARMATURE" and item.object is armature_obj
+        ),
+        None,
+    )
+    if modifier is None:
+        modifier = mesh_obj.modifiers.get("SkinTokensArmature")
+        if modifier is None or modifier.type != "ARMATURE":
+            modifier = mesh_obj.modifiers.new("SkinTokensArmature", "ARMATURE")
+        modifier.object = armature_obj
+    return armature_obj
+
+
+def active_armature_bone_name(armature_object_name: str | None) -> str | None:
+    armature_obj = armature_by_name(armature_object_name)
+    if armature_obj is None:
+        return None
+    bpy = _bpy()
+    if bpy.context.object is not armature_obj:
+        return None
+    if armature_obj.mode == "EDIT":
+        active = armature_obj.data.edit_bones.active
+        if active is not None and (
+            active.select or active.select_head or active.select_tail
+        ):
+            active.select = True
+            active.select_head = True
+            active.select_tail = True
+    elif armature_obj.mode == "POSE":
+        active = armature_obj.data.bones.active
+    else:
+        return None
+    if active is None:
+        return None
+    if armature_obj.mode == "POSE" and not _pose_bone_selected(
+        armature_obj,
+        str(active.name),
+    ):
+        return None
+    return str(active.name)
+
+
+def promote_active_armature_bone_selection(
+    armature_object_name: str | None,
+) -> bool:
+    armature_obj = armature_by_name(armature_object_name)
+    if armature_obj is None or armature_obj.mode != "EDIT":
+        return False
+    bpy = _bpy()
+    if bpy.context.object is not armature_obj:
+        return False
+    active = armature_obj.data.edit_bones.active
+    if active is None or not (
+        active.select or active.select_head or active.select_tail
+    ):
+        return False
+    changed = not (active.select and active.select_head and active.select_tail)
+    if not changed:
+        return False
+    active.select = True
+    active.select_head = True
+    active.select_tail = True
+    return True
+
+
+def apply_armature_context(
+    armature_object_name: str,
+    joints: Sequence[Sequence[float]],
+    parents: Sequence[int],
+    joint_names: Sequence[str],
+    *,
+    select_name: str | None = None,
+    remove_missing: bool = False,
+    mode_after: str | None = None,
+) -> None:
+    bpy = _bpy()
+    mathutils = _mathutils()
+    armature_obj = armature_by_name(armature_object_name)
+    if armature_obj is None:
+        raise RuntimeError(f"armature object not found: {armature_object_name}")
+
+    count = len(joints)
+    names = [
+        str(joint_names[index]) if index < len(joint_names) else f"bone_{index}"
+        for index in range(count)
+    ]
+    if len(parents) != count or len(set(names)) != count:
+        raise ValueError("armature context has invalid parent or bone-name counts")
+    for index, parent in enumerate(parents):
+        if int(parent) < -1 or int(parent) >= index:
+            raise ValueError(f"bone {index} has invalid parent {int(parent)}")
+
+    was_active = bpy.context.object is armature_obj
+    previous_mode = armature_obj.mode if was_active else "OBJECT"
+    active_before = None
+    if was_active and previous_mode == "EDIT":
+        active = armature_obj.data.edit_bones.active
+        active_before = None if active is None else str(active.name)
+    elif was_active and previous_mode == "POSE":
+        active = armature_obj.data.bones.active
+        active_before = None if active is None else str(active.name)
+    selected_name = select_name or active_before
+    final_mode = mode_after or previous_mode
+    if final_mode not in {"OBJECT", "EDIT", "POSE"}:
+        final_mode = "OBJECT"
+
+    managed_before = {
+        bone.name
+        for bone in armature_obj.data.bones
+        if bool(bone.get(MANAGED_BONE_PROP, False))
+    }
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.ops.object.select_all(action="DESELECT")
+    armature_obj.select_set(True)
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+
+    edit_bones = armature_obj.data.edit_bones
+    if remove_missing:
+        keep = set(names)
+        for bone in list(edit_bones):
+            if bone.name not in keep:
+                edit_bones.remove(bone)
+
+    world_to_armature = armature_obj.matrix_world.inverted()
+    created_names: set[str] = set()
+    for index, (name, joint) in enumerate(zip(names, joints)):
+        bone = edit_bones.get(name)
+        if bone is None:
+            bone = edit_bones.new(name)
+            if bone.name != name:
+                raise ValueError(f"generated bone name is not unique: {name}")
+            created_names.add(name)
+        if name in created_names or name in managed_before:
+            head = world_to_armature @ mathutils.Vector(
+                tuple(float(value) for value in joint)
+            )
+            tail = world_to_armature @ mathutils.Vector(
+                tuple(float(value) for value in _tail_for_joint(joints, parents, index))
+            )
+            bone.head = head
+            bone.tail = tail
+            if (bone.tail - bone.head).length_squared < 1e-10:
+                bone.tail = bone.head + mathutils.Vector((0.0, 0.0, 0.1))
+
+    for index, name in enumerate(names):
+        bone = edit_bones[name]
+        parent_index = int(parents[index])
+        new_parent = None if parent_index < 0 else edit_bones[names[parent_index]]
+        current_parent_name = None if bone.parent is None else str(bone.parent.name)
+        new_parent_name = None if new_parent is None else str(new_parent.name)
+        parent_changed = current_parent_name != new_parent_name
+        bone.parent = new_parent
+        if name in created_names or name in managed_before or parent_changed:
+            bone.use_connect = False
+        bone.select = False
+        bone.select_head = False
+        bone.select_tail = False
+    if selected_name is not None and edit_bones.get(selected_name) is not None:
+        selected = edit_bones[selected_name]
+        selected.select = True
+        selected.select_head = True
+        selected.select_tail = True
+        edit_bones.active = selected
+
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for index, name in enumerate(names):
+        bone = armature_obj.data.bones[name]
+        joint_id = str(bone.get(JOINT_ID_PROP, "")) or uuid.uuid4().hex
+        bone[JOINT_ID_PROP] = joint_id
+        parent_index = int(parents[index])
+        bone[PARENT_ID_PROP] = (
+            ""
+            if parent_index < 0
+            else str(
+                armature_obj.data.bones[names[parent_index]].get(
+                    JOINT_ID_PROP,
+                    names[parent_index],
+                )
+            )
+        )
+        bone[DFS_ORDER_PROP] = index
+        if name in created_names:
+            bone[MANAGED_BONE_PROP] = True
+        _set_pose_bone_selected(armature_obj, name, name == selected_name)
+    if (
+        selected_name is not None
+        and armature_obj.data.bones.get(selected_name) is not None
+    ):
+        armature_obj.data.bones.active = armature_obj.data.bones[selected_name]
+
+    if final_mode != "OBJECT":
+        bpy.ops.object.mode_set(mode=final_mode)
+        if (
+            final_mode == "EDIT"
+            and selected_name is not None
+            and armature_obj.data.edit_bones.get(selected_name) is not None
+        ):
+            selected = armature_obj.data.edit_bones[selected_name]
+            selected.select = True
+            selected.select_head = True
+            selected.select_tail = True
+            armature_obj.data.edit_bones.active = selected
+        elif (
+            final_mode == "POSE"
+            and selected_name is not None
+            and armature_obj.data.bones.get(selected_name) is not None
+        ):
+            _set_pose_bone_selected(armature_obj, selected_name, True)
+            armature_obj.data.bones.active = armature_obj.data.bones[selected_name]
+
+
 def parse_mesh_armature(mesh_obj) -> tuple[list[list[float]], list[int], list[str]]:
     armature_obj = armature_for_mesh(mesh_obj)
-    keep_names = {
-        str(group.name)
-        for group in getattr(mesh_obj, "vertex_groups", [])
-        if armature_obj is not None and group.name in armature_obj.data.bones
-    }
-    return parse_armature_object(armature_obj, keep_bone_names=keep_names or None)
+    return parse_armature_object(armature_obj)
+
+
+def armature_matches_context(
+    mesh_obj,
+    joints: Sequence[Sequence[float]],
+    parents: Sequence[int],
+    joint_names: Sequence[str],
+    *,
+    tolerance: float = 1e-4,
+    armature_obj=None,
+) -> bool:
+    if armature_obj is None:
+        armature_obj = armature_for_mesh(mesh_obj)
+    if armature_obj is None:
+        return False
+    existing_joints, existing_parents, existing_names = parse_armature_object(armature_obj)
+    if existing_names != [str(name) for name in joint_names]:
+        return False
+    if existing_parents != [int(parent) for parent in parents]:
+        return False
+    if len(existing_joints) != len(joints):
+        return False
+    tolerance_sq = float(tolerance) ** 2
+    return all(
+        sum(
+            (float(existing[axis]) - float(expected[axis])) ** 2
+            for axis in range(3)
+        )
+        <= tolerance_sq
+        for existing, expected in zip(existing_joints, joints)
+    )
+
+
+def selected_skin_bone_names(mesh_object_name: str) -> list[str]:
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+
+    active_obj = bpy.context.object
+    if active_obj is mesh_obj:
+        active_group = mesh_obj.vertex_groups.active
+        return [] if active_group is None else [str(active_group.name)]
+
+    armature_obj = armature_for_mesh(mesh_obj)
+    if armature_obj is None:
+        raise RuntimeError("the session mesh has no armature")
+    if active_obj is not armature_obj:
+        return []
+
+    if armature_obj.mode == "EDIT":
+        bones = armature_obj.data.edit_bones
+        return [bone.name for bone in bones if bone.select]
+    elif armature_obj.mode == "POSE":
+        return [
+            bone.name
+            for bone in armature_obj.data.bones
+            if _pose_bone_selected(armature_obj, bone.name)
+        ]
+    else:
+        return []
+
+
+def read_mesh_skin_weights(
+    mesh_object_name: str,
+    joint_names: Sequence[str],
+) -> np.ndarray:
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+
+    weights = np.zeros(
+        (len(mesh_obj.data.vertices), len(joint_names)),
+        dtype=np.float32,
+    )
+    group_to_bone = {}
+    for bone_index, name in enumerate(joint_names):
+        group = mesh_obj.vertex_groups.get(str(name))
+        if group is not None:
+            group_to_bone[group.index] = bone_index
+    for vertex in mesh_obj.data.vertices:
+        for assignment in vertex.groups:
+            bone_index = group_to_bone.get(assignment.group)
+            if bone_index is not None:
+                weights[vertex.index, bone_index] = max(0.0, float(assignment.weight))
+    return weights
+
+
+def apply_mesh_skin_weights(
+    mesh_object_name: str,
+    joint_names: Sequence[str],
+    skin: np.ndarray,
+    *,
+    eps: float = 1e-8,
+) -> None:
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+
+    weights = np.asarray(skin, dtype=np.float32)
+    expected_shape = (len(mesh_obj.data.vertices), len(joint_names))
+    if weights.shape != expected_shape:
+        raise ValueError(f"skin shape {weights.shape} does not match {expected_shape}")
+
+    vertex_ids = list(range(expected_shape[0]))
+    groups = []
+    for name in joint_names:
+        group = mesh_obj.vertex_groups.get(str(name))
+        if group is None:
+            group = mesh_obj.vertex_groups.new(name=str(name))
+        if vertex_ids:
+            group.remove(vertex_ids)
+        groups.append(group)
+
+    for bone_index, group in enumerate(groups):
+        nonzero = np.flatnonzero(weights[:, bone_index] > float(eps))
+        for vertex_index in nonzero:
+            group.add(
+                [int(vertex_index)],
+                float(weights[vertex_index, bone_index]),
+                "REPLACE",
+            )
+    mesh_obj.data.update()
+
+
+def _skin_items(
+    row: np.ndarray,
+    names: Sequence[str],
+    *,
+    topk: int,
+    eps: float,
+) -> list[tuple[str, float]]:
+    clean = np.nan_to_num(
+        np.asarray(row, dtype=np.float64),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    clean[clean < 0.0] = 0.0
+    if clean.sum() <= eps:
+        clean[int(np.argmax(clean))] = 1.0
+    count = min(int(topk), clean.shape[0]) if topk > 0 else clean.shape[0]
+    indices = np.argsort(-clean)[:count]
+    indices = indices[clean[indices] > eps]
+    if indices.shape[0] == 0:
+        indices = np.asarray([int(np.argmax(clean))])
+    weights = clean[indices]
+    weights /= max(float(weights.sum()), float(eps))
+    return [(str(names[int(index)]), float(weight)) for index, weight in zip(indices, weights)]
+
+
+def write_mesh_skin_txt(
+    output_path: str | Path,
+    *,
+    mesh_object_name: str,
+    joints: Sequence[Sequence[float]],
+    parents: Sequence[int],
+    joint_names: Sequence[str],
+    blender_to_obj_text: np.ndarray,
+    topk: int = 4,
+    eps: float = 1e-8,
+) -> Path:
+    names = [str(name) for name in joint_names]
+    joint_array = np.asarray(joints, dtype=np.float64)
+    parent_array = np.asarray(parents, dtype=np.int64)
+    matrix = np.asarray(blender_to_obj_text, dtype=np.float64)
+    if joint_array.shape != (len(names), 3):
+        raise ValueError("joint positions and names do not match")
+    if parent_array.shape != (len(names),):
+        raise ValueError("joint parents and names do not match")
+    if matrix.shape != (4, 3):
+        raise ValueError(f"Blender-to-OBJ transform must be 4x3, got {matrix.shape}")
+    roots = np.flatnonzero(parent_array == -1)
+    if roots.shape[0] != 1:
+        raise ValueError(f"expected one skeleton root, found {roots.shape[0]}")
+    if not names:
+        raise ValueError("cannot export skin for an empty skeleton")
+
+    homogeneous = np.concatenate(
+        [joint_array, np.ones((joint_array.shape[0], 1), dtype=np.float64)],
+        axis=1,
+    )
+    obj_joints = homogeneous @ matrix
+    skin = read_mesh_skin_weights(mesh_object_name, names)
+
+    lines = []
+    for name, xyz in zip(names, obj_joints):
+        lines.append(f"joints {name} {xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f}\n")
+    lines.append(f"root {names[int(roots[0])]}\n")
+    for vertex_id, row in enumerate(skin):
+        parts = [f"skin {vertex_id}"]
+        for name, weight in _skin_items(row, names, topk=topk, eps=eps):
+            parts.extend([name, f"{weight:.6f}"])
+        lines.append(" ".join(parts) + "\n")
+    for child, parent in enumerate(parent_array.tolist()):
+        if parent != -1:
+            lines.append(f"hier {names[int(parent)]} {names[child]}\n")
+    lines.extend(
+        [
+            "info Scale 1.000000\n",
+            "info Pivot 0.000000 0.000000 0.000000\n",
+        ]
+    )
+
+    resolved = Path(output_path).expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text("".join(lines), encoding="utf-8")
+    return resolved
 
 
 def create_armature(
@@ -193,27 +692,18 @@ def create_armature(
 
     mesh_world = mesh_obj.matrix_world.copy()
     old_skintokens_armatures = []
-    old_foreign_armatures = []
     for modifier in list(mesh_obj.modifiers):
         if modifier.type != "ARMATURE":
             continue
         if modifier.object is not None and "SkinTokensArmature" in modifier.object.name:
             old_skintokens_armatures.append(modifier.object)
-        elif modifier.object is not None:
-            old_foreign_armatures.append(modifier.object)
         mesh_obj.modifiers.remove(modifier)
     if mesh_obj.parent is not None and mesh_obj.parent.type == "ARMATURE":
-        old_foreign_armatures.append(mesh_obj.parent)
         mesh_obj.parent = None
         mesh_obj.matrix_world = mesh_world
     for old_armature in old_skintokens_armatures:
         if old_armature.name in bpy.data.objects:
             bpy.data.objects.remove(old_armature, do_unlink=True)
-    for old_armature in old_foreign_armatures:
-        if old_armature.name in bpy.data.objects:
-            old_armature.hide_set(True)
-            old_armature.hide_viewport = True
-
     armature_data = bpy.data.armatures.new(f"{mesh_obj.name}_SkinTokensArmature")
     armature_obj = bpy.data.objects.new(armature_data.name, armature_data)
     bpy.context.scene.collection.objects.link(armature_obj)
@@ -265,6 +755,7 @@ def import_skin_output(
     joints: Sequence[Sequence[float]] | None = None,
     parents: Sequence[int] | None = None,
     joint_names: Sequence[str] | None = None,
+    armature_object_name: str | None = None,
 ) -> None:
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
@@ -298,4 +789,23 @@ def import_skin_output(
     if joints is not None and parents is not None:
         if joint_names is None:
             joint_names = [f"bone_{i}" for i in range(len(joints))]
-        create_armature(obj, joints, parents, joint_names)
+        source_armature = armature_by_name(armature_object_name)
+        matches = armature_matches_context(
+            obj,
+            joints,
+            parents,
+            joint_names,
+            armature_obj=source_armature,
+        )
+        if source_armature is not None:
+            if not matches:
+                raise RuntimeError(
+                    "working armature no longer matches the skin skeleton"
+                )
+            if armature_for_mesh(obj) is not source_armature and source_armature is not None:
+                modifier = obj.modifiers.new("SkinTokensArmature", "ARMATURE")
+                modifier.object = source_armature
+        elif matches:
+            pass
+        else:
+            create_armature(obj, joints, parents, joint_names)

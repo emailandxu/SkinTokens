@@ -1,0 +1,29 @@
+schema_version = "1.0.0"
+
+id = "skintokens_interactive"
+version = "1.8.0"
+name = "SkinTokens Interactive"
+tagline = "Generate and edit rigs and skin weights with SkinTokens"
+maintainer = "SkinTokens"
+type = "add-on"
+
+tags = ["Rigging"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+network = "Connect to the SkinTokens model service"
+files = "Upload meshes and export generated skin data"
+
+[build]
+paths = [
+  "__init__.py",
+  "addon.py",
+  "apply_skin.py",
+  "client.py",
+  "core.py",
+  "mesh.py",
+  "transport.py",
+  "LICENSE",
+  "README.md",
+]

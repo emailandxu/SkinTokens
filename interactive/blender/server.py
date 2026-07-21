@@ -9,7 +9,7 @@ from pathlib import Path
 from interactive.protocol import (
     AUTHKEY,
     BLENDER_SOCKET_PATH,
-    MODEL_SOCKET_PATH,
+    DEFAULT_MODEL_URL,
     ensure_runtime_dir,
     err,
     ok,
@@ -39,6 +39,11 @@ def serve(args: argparse.Namespace) -> None:
                     response = core.start(payload["obj_path"], **payload.get("options", {}))
                 elif command == "next":
                     response = core.next(payload["blender_session_id"], **payload.get("options", {}))
+                elif command == "rig":
+                    response = core.rig(
+                        payload["blender_session_id"],
+                        **payload.get("options", {}),
+                    )
                 elif command == "branch":
                     response = core.branch(payload["blender_session_id"], **payload.get("options", {}))
                 elif command == "skin":
@@ -46,6 +51,10 @@ def serve(args: argparse.Namespace) -> None:
                         payload["blender_session_id"],
                         output_path=payload.get("output_path"),
                         **payload.get("options", {}),
+                    )
+                elif command == "reconstruct":
+                    response = core.reconstruct_selected_skin(
+                        payload["blender_session_id"],
                     )
                 elif command == "reset":
                     response = core.reset(payload["blender_session_id"])
@@ -64,7 +73,12 @@ def serve(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive SkinTokens Blender validation server.")
     parser.add_argument("--socket", default=str(BLENDER_SOCKET_PATH))
-    parser.add_argument("--model-socket", default=str(MODEL_SOCKET_PATH))
+    parser.add_argument(
+        "--model-endpoint",
+        "--model-socket",
+        dest="model_socket",
+        default=DEFAULT_MODEL_URL,
+    )
     return parser
 
 

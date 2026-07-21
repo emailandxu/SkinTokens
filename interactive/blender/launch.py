@@ -20,7 +20,19 @@ def parse_launcher_args() -> argparse.Namespace:
     parser.add_argument("--obj", dest="mesh_option", default=None, help="OBJ/FBX path to import.")
     parser.add_argument("--fbx", dest="mesh_option", default=None, help="FBX path to import.")
     parser.add_argument("--txt", default=None, help="Optional heter-skinning txt to prefill.")
-    parser.add_argument("--output", default=None, help="Output skin txt path.")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Save the latest generated skin TXT here when Finish is pressed.",
+    )
+    parser.add_argument("--server-url", default=None, help="Interactive HTTP model server URL.")
+    parser.add_argument("--next-tokens", type=int, default=None)
+    parser.add_argument("--skin-tokens", type=int, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--num-beams", type=int, default=None)
     args = parser.parse_args(raw_args)
     mesh = args.mesh_option or args.mesh or str(DEFAULT_MESH_PATH)
     mesh_path = Path(mesh).expanduser()
@@ -33,11 +45,8 @@ def parse_launcher_args() -> argparse.Namespace:
     if mesh_path.suffix.lower() not in {".obj", ".fbx"}:
         raise ValueError(f"expected .obj or .fbx, got: {mesh_path}")
     args.mesh_path = mesh_path
-    if args.output is None:
-        args.output_path = (
-            REPO_ROOT / "results" / f"{mesh_path.stem}_interactive_skin.txt"
-        ).resolve()
-    else:
+    args.output_path = None
+    if args.output is not None:
         output_path = Path(args.output).expanduser()
         args.output_path = (
             (REPO_ROOT / output_path).resolve()
@@ -100,7 +109,23 @@ def main():
         mesh["skintokens_source_fbx"] = str(args.mesh_path)
     bpy.context.view_layer.objects.active = mesh
     mesh.select_set(True)
-    bpy.context.scene.skintokens_output_path = str(args.output_path)
+    bpy.context.scene.skintokens_output_path = (
+        "" if args.output_path is None else str(args.output_path)
+    )
+    if args.server_url is not None:
+        bpy.context.scene.skintokens_model_socket = args.server_url.rstrip("/")
+    parameter_overrides = {
+        "skintokens_max_new_tokens": args.next_tokens,
+        "skintokens_skin_max_new_tokens": args.skin_tokens,
+        "skintokens_top_k": args.top_k,
+        "skintokens_top_p": args.top_p,
+        "skintokens_temperature": args.temperature,
+        "skintokens_repetition_penalty": args.repetition_penalty,
+        "skintokens_num_beams": args.num_beams,
+    }
+    for property_name, value in parameter_overrides.items():
+        if value is not None:
+            setattr(bpy.context.scene, property_name, value)
     if args.txt_path is not None:
         bpy.context.scene.skintokens_import_txt_path = str(args.txt_path)
     bpy.context.scene.skintokens_status = (

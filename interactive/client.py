@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .protocol import BLENDER_SOCKET_PATH, MODEL_SOCKET_PATH, request
+from .protocol import BLENDER_SOCKET_PATH, DEFAULT_MODEL_URL, request
 
 
 def print_response(response: dict) -> None:
@@ -42,6 +42,9 @@ def model_smoke(args: argparse.Namespace) -> None:
                 "session_id": session_id,
                 **context,
                 "output_path": args.output,
+                "midprocess": args.midprocess,
+                "skin_num_beams": args.skin_num_beams,
+                "skin_postprocess": args.skin_postprocess,
             },
         )
         print_response(response)
@@ -74,6 +77,11 @@ def blender_smoke(args: argparse.Namespace) -> None:
                 "command": "skin",
                 "blender_session_id": blender_session_id,
                 "output_path": args.output,
+                "options": {
+                    "midprocess": args.midprocess,
+                    "skin_num_beams": args.skin_num_beams,
+                    "skin_postprocess": args.skin_postprocess,
+                },
             },
         )
         print_response(response)
@@ -84,11 +92,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="target", required=True)
 
     model = sub.add_parser("model", help="Talk directly to the interactive model server.")
-    model.add_argument("--socket", default=str(MODEL_SOCKET_PATH))
+    model.add_argument("--endpoint", "--socket", dest="socket", default=DEFAULT_MODEL_URL)
     model.add_argument("--obj", default="examples/xiaobaozi.obj")
     model.add_argument("--steps", type=int, default=2)
     model.add_argument("--max-new-tokens", type=int, default=16)
     model.add_argument("--skin", action="store_true")
+    model.add_argument(
+        "--midprocess",
+        choices=["none", "similar-subtrees", "dfs-ensemble"],
+        default="dfs-ensemble",
+    )
+    model.add_argument("--skin-num-beams", type=int, default=10)
+    model.add_argument(
+        "--skin-postprocess",
+        choices=["none", "voxel", "latent", "vae-reconstruction"],
+        default="none",
+    )
     model.add_argument("--output", default="results/xiaobaozi_interactive_skin.txt")
     model.set_defaults(func=model_smoke)
 
@@ -98,6 +117,17 @@ def build_parser() -> argparse.ArgumentParser:
     blender.add_argument("--steps", type=int, default=2)
     blender.add_argument("--max-new-tokens", type=int, default=16)
     blender.add_argument("--skin", action="store_true")
+    blender.add_argument(
+        "--midprocess",
+        choices=["none", "similar-subtrees", "dfs-ensemble"],
+        default="dfs-ensemble",
+    )
+    blender.add_argument("--skin-num-beams", type=int, default=10)
+    blender.add_argument(
+        "--skin-postprocess",
+        choices=["none", "voxel", "latent", "vae-reconstruction"],
+        default="none",
+    )
     blender.add_argument("--output", default="results/xiaobaozi_interactive_skin.txt")
     blender.set_defaults(func=blender_smoke)
 
@@ -111,4 +141,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

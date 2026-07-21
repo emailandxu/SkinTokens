@@ -3,11 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from dataclasses import dataclass
-from multiprocessing.connection import Client
 from pathlib import Path
 from typing import Any, Dict
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
@@ -15,13 +13,9 @@ from urllib.request import urlopen
 import numpy as np
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_DIR = REPO_ROOT / ".runtime"
-MODEL_SOCKET_PATH = RUNTIME_DIR / "interactive_model.sock"
-BLENDER_SOCKET_PATH = RUNTIME_DIR / "interactive_blender.sock"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8765"
-AUTHKEY = b"skintokens-interactive"
-
+PROTOCOL_VERSION = 1
+EXTENSION_VERSION = "1.8.0"
 
 Request = Dict[str, Any]
 Response = Dict[str, Any]
@@ -66,31 +60,15 @@ def decode_float32_array(payload: Any, expected_shape: tuple[int, ...]) -> np.nd
     return np.frombuffer(raw, dtype="<f4").reshape(expected_shape).copy()
 
 
-@dataclass(frozen=True)
-class SocketConfig:
-    path: Path = MODEL_SOCKET_PATH
-    authkey: bytes = AUTHKEY
-
-
-def ensure_runtime_dir() -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def ok(**payload: Any) -> Response:
-    return {"ok": True, **payload}
-
-
-def err(message: str, **payload: Any) -> Response:
-    return {"ok": False, "error": message, **payload}
-
-
-def _is_http_endpoint(endpoint: str | Path) -> bool:
-    value = str(endpoint)
-    return value.startswith("http://") or value.startswith("https://")
-
-
-def _http_request(endpoint: str | Path, payload: Request) -> Response:
-    base_url = str(endpoint).rstrip("/")
+def request(
+    endpoint: str | Path,
+    payload: Request,
+    *,
+    timeout: float = 300.0,
+) -> Response:
+    base_url = str(endpoint).strip().rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        raise ValueError("server URL must start with http:// or https://")
     command = str(payload.get("command", ""))
     owner_id = str(payload.get("owner_id", "anonymous"))
     headers = {"X-SkinTokens-Owner": owner_id}
@@ -99,13 +77,15 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
         obj_path = Path(str(payload["obj_path"])).expanduser().resolve()
         body = obj_path.read_bytes()
         url = f"{base_url}/v1/sessions"
-        headers.update({
-            "Content-Type": "application/octet-stream",
-            "X-SkinTokens-Filename": obj_path.name,
-            "X-SkinTokens-Initial-Bones": str(
-                max(0, int(payload.get("initial_bone_count", 0)))
-            ),
-        })
+        headers.update(
+            {
+                "Content-Type": "application/octet-stream",
+                "X-SkinTokens-Filename": obj_path.name,
+                "X-SkinTokens-Initial-Bones": str(
+                    max(0, int(payload.get("initial_bone_count", 0)))
+                ),
+            }
+        )
     else:
         session_id = quote(str(payload.get("session_id", "")), safe="")
         if command == "ping":
@@ -128,7 +108,7 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
         method = "DELETE"
     request_obj = UrlRequest(url, data=body, headers=headers, method=method)
     try:
-        with urlopen(request_obj, timeout=300) as response:
+        with urlopen(request_obj, timeout=max(1.0, float(timeout))) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -136,9 +116,14 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
             response_payload = json.loads(raw)
         except json.JSONDecodeError:
             response_payload = {"ok": False, "error": raw or str(exc)}
+    except URLError as exc:
+        raise RuntimeError(f"cannot connect to SkinTokens server at {base_url}: {exc}") from exc
 
     if not isinstance(response_payload, dict):
-        raise RuntimeError(f"interactive HTTP server returned non-dict response: {type(response_payload)}")
+        raise RuntimeError(
+            "SkinTokens server returned a non-object response: "
+            f"{type(response_payload).__name__}"
+        )
 
     output_path = payload.get("output_path")
     txt_content = response_payload.pop("txt_content", None)
@@ -148,14 +133,3 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
         resolved_output.write_text(str(txt_content), encoding="utf-8")
         response_payload["output_path"] = str(resolved_output)
     return response_payload
-
-
-def request(socket_path: str | Path, payload: Request, authkey: bytes = AUTHKEY) -> Response:
-    if _is_http_endpoint(socket_path):
-        return _http_request(socket_path, payload)
-    with Client(str(socket_path), family="AF_UNIX", authkey=authkey) as conn:
-        conn.send(payload)
-        response = conn.recv()
-    if not isinstance(response, dict):
-        raise RuntimeError(f"interactive server returned non-dict response: {type(response)}")
-    return response
