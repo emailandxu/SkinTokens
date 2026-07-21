@@ -87,7 +87,7 @@ DEFAULT_SESSION_CLEANUP_INTERVAL_SECONDS = 60.0
 DEFAULT_MODEL_CKPT = "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt"
 DEFAULT_USAGE_DIR = RUNTIME_DIR / "usage"
 PROTOCOL_VERSION = 1
-SERVER_VERSION = "1.8.0"
+SERVER_VERSION = "1.8.2"
 GENERIC_BONE_NAME = re.compile(r"^bone_(\d+)(?:\.\d+)?$")
 
 
@@ -310,6 +310,7 @@ class InteractiveModelServer:
             session_id=record.session_id,
             client_id=record.owner_id,
             client_ip=record.client_ip,
+            blender_extension_version=record.blender_extension_version,
             initial_bone_count=record.initial_bone_count,
             initial_has_skin=False,
             vertex_count=record.vertex_count,
@@ -331,6 +332,7 @@ class InteractiveModelServer:
             session_id=record.session_id,
             client_id=record.owner_id,
             client_ip=record.client_ip,
+            blender_extension_version=record.blender_extension_version,
             end_reason=str(reason or "reset")[:64],
             duration_seconds=max(0.0, ended_at - float(record.created_at)),
             initial_bone_count=record.initial_bone_count,
@@ -501,6 +503,10 @@ class InteractiveModelServer:
             created_at=now,
             updated_at=now,
             client_ip=(str(payload.get("client_ip", "local")).strip() or "unknown")[:64],
+            blender_extension_version=(
+                str(payload.get("blender_extension_version", "unknown")).strip()
+                or "unknown"
+            )[:32],
             initial_bone_count=max(0, int(payload.get("initial_bone_count", 0))),
         )
         record.latest_bone_count = record.initial_bone_count

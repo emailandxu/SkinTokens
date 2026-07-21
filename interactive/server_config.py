@@ -21,6 +21,8 @@ DEFAULT_SERVER_CONFIG: dict[str, Any] = {
     "asset_dir": "interactive_assets",
     "result_dir": "interactive_results",
     "usage_dir": "usage",
+    "blender_extensions_enabled": True,
+    "blender_extensions_dir": "blender_extensions",
     "max_runtime_sessions": 8,
     "max_sessions": 512,
     "session_idle_timeout_seconds": 3600,
@@ -30,7 +32,13 @@ DEFAULT_SERVER_CONFIG: dict[str, Any] = {
     "max_pending_gpu_requests": 8,
     "max_upload_mb": 100,
 }
-_RUNTIME_PATH_KEYS = {"asset_dir", "result_dir", "socket", "usage_dir"}
+_RUNTIME_PATH_KEYS = {
+    "asset_dir",
+    "blender_extensions_dir",
+    "result_dir",
+    "socket",
+    "usage_dir",
+}
 
 
 def _write_default_config(path: Path) -> None:

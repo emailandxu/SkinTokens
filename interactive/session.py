@@ -95,6 +95,7 @@ class SessionRecord:
     created_at: float
     updated_at: float
     client_ip: str = "local"
+    blender_extension_version: str = "unknown"
     reserved_joint_names: set[str] = field(default_factory=set)
     next_bone_id: int = 0
     initial_bone_count: int = 0

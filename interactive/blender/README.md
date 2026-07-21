@@ -12,3 +12,20 @@ Online Access** button. If Blender was launched with `--offline-mode`, restart
 it without that option first.
 
 The model service and checkpoint are not included in this extension package.
+
+For repository-based installation, add the SkinTokens model server as a Blender
+Extension Repository, then install the package by ID:
+
+```bash
+blender --online-mode --command extension repo-add skintokens \
+  --name "SkinTokens Blender Extensions" \
+  --url http://SERVER:8765/blender/extensions/
+blender --online-mode --command extension install \
+  --sync --enable skintokens_interactive
+```
+
+Repository installations trigger one non-blocking sync of their own repository
+when the extension loads. When the synchronized repository index contains a newer
+SkinTokens version, the idle **Start** button becomes **Update** and delegates
+the replacement to Blender's native extension installer. Packages installed
+into a local repository from disk keep the normal **Start** button.

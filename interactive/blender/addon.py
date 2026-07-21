@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -43,6 +44,13 @@ _ARMATURE_WATCH_INTERVAL = 0.15
 _DEBUG_LOG_PATH = Path(tempfile.gettempdir()) / "skintokens_interactive_debug.log"
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
+_EXTENSION_PACKAGE_ID = "skintokens_interactive"
+_SEMVER_PATTERN = re.compile(
+    r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+_UPDATE_INDEX_CACHE: dict | None = None
+_UPDATE_SYNC_START_TIMER_REGISTERED = False
+_UPDATE_SYNC_POLL_TIMER_REGISTERED = False
 
 
 def _debug_log(event: str, **fields) -> None:
@@ -177,6 +185,204 @@ def online_access_forced_off() -> bool:
     return not online_access_enabled() and bool(
         getattr(bpy.app, "online_access_override", False)
     )
+
+
+def _extension_repository(preferences):
+    package_parts = __package__.split(".")
+    if (
+        len(package_parts) != 3
+        or package_parts[0] != "bl_ext"
+        or package_parts[2] != _EXTENSION_PACKAGE_ID
+    ):
+        return None
+    repo_module = package_parts[1]
+    for repo_index, repo in enumerate(preferences.extensions.repos):
+        if repo.module == repo_module:
+            return repo_index, repo
+    return None
+
+
+def _parse_semver(value: str):
+    match = _SEMVER_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return None
+    prerelease = match.group(4)
+    prerelease_parts = None
+    if prerelease is not None:
+        prerelease_parts = tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in prerelease.split(".")
+        )
+    return (
+        (int(match.group(1)), int(match.group(2)), int(match.group(3))),
+        prerelease_parts,
+    )
+
+
+def _version_is_newer(remote_version: str, installed_version: str) -> bool:
+    remote = _parse_semver(remote_version)
+    installed = _parse_semver(installed_version)
+    if remote is None or installed is None:
+        return False
+    if remote[0] != installed[0]:
+        return remote[0] > installed[0]
+    remote_prerelease = remote[1]
+    installed_prerelease = installed[1]
+    if remote_prerelease is None:
+        return installed_prerelease is not None
+    if installed_prerelease is None:
+        return False
+    return remote_prerelease > installed_prerelease
+
+
+def _extension_update_info(preferences):
+    global _UPDATE_INDEX_CACHE
+    repository = _extension_repository(preferences)
+    if repository is None:
+        return None
+    repo_index, repo = repository
+    if not repo.use_remote_url or not repo.remote_url:
+        return None
+
+    index_path = Path(repo.directory) / ".blender_ext" / "index.json"
+    try:
+        stat = index_path.stat()
+    except OSError:
+        return None
+    cache_key = (
+        str(index_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        EXTENSION_VERSION,
+    )
+    if _UPDATE_INDEX_CACHE is not None and _UPDATE_INDEX_CACHE["key"] == cache_key:
+        return _UPDATE_INDEX_CACHE["value"]
+
+    update = None
+    try:
+        repository_index = json.loads(index_path.read_text(encoding="utf-8"))
+        packages = (
+            repository_index.get("data", [])
+            if isinstance(repository_index, dict)
+            else []
+        )
+        if not isinstance(packages, list):
+            packages = []
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            if package.get("id") != _EXTENSION_PACKAGE_ID:
+                continue
+            remote_version = str(package.get("version", ""))
+            if _version_is_newer(remote_version, EXTENSION_VERSION):
+                update = {
+                    "repo_index": repo_index,
+                    "version": remote_version,
+                }
+            break
+    except (OSError, ValueError, TypeError):
+        update = None
+    _UPDATE_INDEX_CACHE = {"key": cache_key, "value": update}
+    return update
+
+
+def _finish_extension_repository_sync() -> None:
+    global _UPDATE_INDEX_CACHE, _UPDATE_SYNC_POLL_TIMER_REGISTERED
+    _UPDATE_INDEX_CACHE = None
+    _UPDATE_SYNC_POLL_TIMER_REGISTERED = False
+    _redraw_sidebar()
+
+
+def _extension_repository_sync_running() -> bool:
+    modal_operators = getattr(
+        bpy.context.window_manager,
+        "modal_operators",
+        None,
+    )
+    return bool(
+        modal_operators is not None
+        and modal_operators.get("EXTENSIONS_OT_repo_sync") is not None
+    )
+
+
+def _poll_extension_repository_sync() -> float | None:
+    if _extension_repository_sync_running():
+        return 0.1
+    _finish_extension_repository_sync()
+    return None
+
+
+def _start_extension_repository_sync() -> float | None:
+    global _UPDATE_SYNC_START_TIMER_REGISTERED
+    global _UPDATE_SYNC_POLL_TIMER_REGISTERED
+    if _extension_repository_sync_running():
+        return 0.25
+
+    _UPDATE_SYNC_START_TIMER_REGISTERED = False
+    repository = _extension_repository(bpy.context.preferences)
+    if repository is None or not online_access_enabled():
+        return None
+    repo_index, repo = repository
+    if not repo.use_remote_url or not repo.remote_url:
+        return None
+
+    try:
+        result = bpy.ops.extensions.repo_sync(
+            "INVOKE_DEFAULT",
+            repo_index=repo_index,
+        )
+    except Exception as exc:
+        _debug_log("extension.update_sync_failed", error=str(exc))
+        _finish_extension_repository_sync()
+        return None
+
+    _debug_log(
+        "extension.update_sync_started",
+        repo_module=str(repo.module),
+        result=sorted(result),
+    )
+    if "RUNNING_MODAL" not in result:
+        _finish_extension_repository_sync()
+        return None
+    if not _UPDATE_SYNC_POLL_TIMER_REGISTERED:
+        _UPDATE_SYNC_POLL_TIMER_REGISTERED = True
+        bpy.app.timers.register(
+            _poll_extension_repository_sync,
+            first_interval=0.1,
+        )
+    return None
+
+
+def _schedule_extension_repository_sync(delay: float = 2.0) -> None:
+    global _UPDATE_SYNC_START_TIMER_REGISTERED
+    if _UPDATE_SYNC_START_TIMER_REGISTERED:
+        return
+    repository = _extension_repository(bpy.context.preferences)
+    if repository is None:
+        return
+    _repo_index, repo = repository
+    if not repo.use_remote_url or not repo.remote_url:
+        return
+    repo.use_sync_on_startup = False
+    if not online_access_enabled():
+        return
+    _UPDATE_SYNC_START_TIMER_REGISTERED = True
+    bpy.app.timers.register(
+        _start_extension_repository_sync,
+        first_interval=max(0.0, float(delay)),
+    )
+
+
+def _cancel_extension_repository_sync() -> None:
+    global _UPDATE_SYNC_START_TIMER_REGISTERED, _UPDATE_SYNC_POLL_TIMER_REGISTERED
+    for callback in (
+        _start_extension_repository_sync,
+        _poll_extension_repository_sync,
+    ):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
+    _UPDATE_SYNC_START_TIMER_REGISTERED = False
+    _UPDATE_SYNC_POLL_TIMER_REGISTERED = False
 
 
 def async_busy() -> bool:
@@ -1016,6 +1222,7 @@ class SKINTOKENS_OT_enable_online_access(bpy.types.Operator):
             self.report({"ERROR"}, "Blender did not enable Online Access")
             return {"CANCELLED"}
         set_status(context, "Online Access enabled")
+        _schedule_extension_repository_sync(delay=0.0)
         return {"FINISHED"}
 
 
@@ -1386,8 +1593,8 @@ class SKINTOKENS_OT_split(bpy.types.Operator):
 
 class SKINTOKENS_OT_delete(bpy.types.Operator):
     bl_idname = "skintokens_interactive.delete"
-    bl_label = "Delete"
-    bl_description = "Delete a leaf or dissolve the active bone's downstream joint"
+    bl_label = "Collapse"
+    bl_description = "Collapse the active bone's child segment or remove an active leaf"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1404,13 +1611,12 @@ class SKINTOKENS_OT_delete(bpy.types.Operator):
                 count = len(response.get("context", {}).get("joints", []))
                 set_status(
                     result_context,
-                    f"Deleted {response.get('deleted_bone_name')} "
-                    f"[{response.get('delete_operation')}]. Joints: {count}",
+                    f"Collapsed {response.get('deleted_bone_name')}. Joints: {count}",
                 )
 
             _schedule_context_edit(
                 context,
-                label="Delete",
+                label="Collapse",
                 prepared=prepared,
                 apply_result=core.apply_delete_request,
                 success=succeeded,
@@ -1418,7 +1624,7 @@ class SKINTOKENS_OT_delete(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Delete failed: {exc}")
+            set_status(context, f"Collapse failed: {exc}")
             return {"CANCELLED"}
 
 
@@ -1495,7 +1701,22 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
         if has_session_marker(context):
             state_row.operator("skintokens_interactive.finish", icon="X")
         else:
-            state_row.operator("skintokens_interactive.start", icon="PLAY")
+            update = (
+                None
+                if preferences is None
+                else _extension_update_info(context.preferences)
+            )
+            if update is None:
+                state_row.operator("skintokens_interactive.start", icon="PLAY")
+            else:
+                props = state_row.operator(
+                    "extensions.package_install",
+                    text=f"Update to {update['version']}",
+                    icon="FILE_REFRESH",
+                )
+                props.repo_index = update["repo_index"]
+                props.pkg_id = _EXTENSION_PACKAGE_ID
+                props.enable_on_install = True
 
 
 classes = (
@@ -1565,10 +1786,12 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(
             sync_model_after_armature_change
         )
+    _schedule_extension_repository_sync()
 
 
 def unregister():
-    global _CORE
+    global _CORE, _UPDATE_INDEX_CACHE
+    _UPDATE_INDEX_CACHE = None
     if sync_model_after_history_change in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.remove(sync_model_after_history_change)
     if sync_model_after_history_change in bpy.app.handlers.redo_post:
@@ -1580,6 +1803,7 @@ def unregister():
     cancel_history_sync()
     cancel_armature_watch()
     cancel_async_job()
+    _cancel_extension_repository_sync()
     core = _CORE
     _CORE = None
     if core is not None:

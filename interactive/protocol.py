@@ -18,7 +18,6 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = REPO_ROOT / ".runtime"
 MODEL_SOCKET_PATH = RUNTIME_DIR / "interactive_model.sock"
-BLENDER_SOCKET_PATH = RUNTIME_DIR / "interactive_blender.sock"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8765"
 AUTHKEY = b"skintokens-interactive"
 

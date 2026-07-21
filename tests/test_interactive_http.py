@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,8 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import urlopen
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import numpy as np
@@ -18,6 +21,7 @@ from infer import build_parser as build_infer_parser
 from infer import infer_asset
 from interactive.asset_store import MeshAssetStore
 from interactive.blender.apply_skin import selected_skin_bone_names
+from interactive.blender.transport import request as blender_request
 from interactive.blender.core import (
     BlenderInteractiveCore,
     BlenderInteractiveSession,
@@ -45,7 +49,7 @@ class FakeModelService:
             "ok": True,
             "message": "pong",
             "protocol_version": 1,
-            "server_version": "1.8.0",
+            "server_version": "1.8.2",
         }
 
     def handle(self, payload: dict) -> dict:
@@ -124,12 +128,37 @@ class InteractiveHttpTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.service = FakeModelService()
+        self.extension_archive = b"blender-extension-archive"
+        self.extension_archive_name = "skintokens_interactive-1.8.2.zip"
+        self.extension_repo = root / "blender_extensions"
+        self.extension_repo.mkdir()
+        (self.extension_repo / self.extension_archive_name).write_bytes(
+            self.extension_archive
+        )
+        (self.extension_repo / "index.json").write_text(
+            json.dumps({
+                "version": "v1",
+                "blocklist": [],
+                "data": [{
+                    "schema_version": "1.0.0",
+                    "id": "skintokens_interactive",
+                    "name": "SkinTokens Interactive",
+                    "version": "1.8.2",
+                    "type": "add-on",
+                    "archive_url": f"./{self.extension_archive_name}",
+                    "archive_size": len(self.extension_archive),
+                    "archive_hash": "sha256:test",
+                }],
+            }),
+            encoding="utf-8",
+        )
         self.api = InteractiveHttpApi(
             service=self.service,  # type: ignore[arg-type]
             asset_store=MeshAssetStore(root / "assets"),
             result_dir=root / "results",
             max_upload_bytes=1024 * 1024,
             max_pending_gpu_requests=2,
+            blender_extensions_dir=self.extension_repo,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -240,6 +269,47 @@ class InteractiveHttpTest(unittest.TestCase):
 
     def test_json_parser_limit_matches_configured_upload_limit(self) -> None:
         self.assertGreaterEqual(BaseRequest.MEMFILE_MAX, 1024 * 1024)
+
+    def test_blender_extension_repository_serves_index_and_archive(self) -> None:
+        with urlopen(f"{self.endpoint}/blender/extensions/index.json") as result:
+            index = json.loads(result.read().decode("utf-8"))
+            self.assertEqual(result.headers["Cache-Control"], "no-cache")
+        self.assertEqual(index["data"][0]["version"], "1.8.2")
+
+        with urlopen(
+            f"{self.endpoint}/blender/extensions/{self.extension_archive_name}"
+        ) as result:
+            archive = result.read()
+            cache_control = result.headers["Cache-Control"]
+        self.assertEqual(archive, self.extension_archive)
+        self.assertIn("immutable", cache_control)
+
+        health = request(self.endpoint, {"command": "ping"})
+        repository = health["blender_extensions"]
+        self.assertTrue(repository["ready"])
+        self.assertEqual(repository["latest_version"], "1.8.2")
+        self.assertEqual(repository["repository_path"], "/blender/extensions/")
+
+    def test_blender_extension_repository_rejects_unpublished_files(self) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(f"{self.endpoint}/blender/extensions/not-an-extension.txt")
+        self.assertEqual(raised.exception.code, 404)
+
+    def test_blender_transport_reports_extension_version(self) -> None:
+        started = blender_request(
+            self.endpoint,
+            {
+                "command": "start",
+                "obj_path": str(self.obj_path),
+                "owner_id": "blender-client",
+            },
+        )
+
+        self.assertTrue(started["ok"])
+        self.assertEqual(
+            self.service.calls[0]["blender_extension_version"],
+            "1.8.6",
+        )
 
     def test_infer_cli_uses_running_http_service(self) -> None:
         output_path = Path(self.temporary.name) / "infer" / "skin.txt"
@@ -1086,7 +1156,7 @@ class BlenderRecoveryTest(unittest.TestCase):
             mode_after="EDIT",
         )
 
-    def test_split_uses_active_bone_and_selects_midpoint(self) -> None:
+    def test_split_uses_and_keeps_active_bone_selected(self) -> None:
         context = {
             "joints": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
             "parents": [-1, 0],
@@ -1127,10 +1197,53 @@ class BlenderRecoveryTest(unittest.TestCase):
         applied.assert_called_once_with(
             session,
             response["context"],
-            select_name="root_split",
+            select_name="root",
             remove_missing=True,
             mode_after="EDIT",
         )
+
+    def test_split_reparents_all_direct_children_to_midpoint(self) -> None:
+        context = {
+            "joints": [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            "parents": [-1, 0, 1, 0],
+            "joint_names": ["root", "branch", "leaf", "sibling"],
+            "done": False,
+        }
+        core = BlenderInteractiveCore("http://model.example", owner_id="client-a")
+        session = BlenderInteractiveSession(
+            blender_session_id="blender-session",
+            model_session_id="model-session",
+            obj_path=Path("mesh.obj"),
+            context=context,
+            mesh_object_name="Mesh",
+            armature_object_name="Armature",
+        )
+        core.sessions[session.blender_session_id] = session
+        core.session_request = Mock(
+            side_effect=lambda _session, payload: {"ok": True, "context": payload}
+        )
+        with (
+            patch.object(core, "sync_context_from_armature"),
+            patch.object(core, "_result_mode", return_value="EDIT"),
+            patch.object(core, "_apply_context_to_armature"),
+            patch(
+                "interactive.blender.core.active_armature_bone_name",
+                return_value="root",
+            ),
+        ):
+            response = core.split_selected_bone(session.blender_session_id)
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(
+            response["context"]["joint_names"],
+            ["root", "root_split", "branch", "leaf", "sibling"],
+        )
+        self.assertEqual(response["context"]["parents"], [-1, 0, 1, 2, 1])
 
     def test_delete_dissolves_active_bone_downstream_segment(self) -> None:
         context = {

@@ -22,10 +22,21 @@ apply_skin = importlib.import_module(f"{package_name}.apply_skin")
 transport = importlib.import_module(f"{package_name}.transport")
 
 assert addon.__package__ == package_name
+assert transport.EXTENSION_VERSION == "1.8.6"
 assert hasattr(bpy.types.Scene, "skintokens_status")
 assert str(
     bpy.context.preferences.addons[package_name].preferences.server_url
-) == "http://127.0.0.1:8765"
+) == "http://172.17.60.251:8765"
+assert addon._version_is_newer("1.8.4", "1.8.3")
+assert addon._version_is_newer("2.0.0", "1.99.99")
+assert addon._version_is_newer("1.8.4", "1.8.4-beta.1")
+assert not addon._version_is_newer("1.8.4", "1.8.4")
+assert not addon._version_is_newer("1.8.4-beta.1", "1.8.4")
+repository = addon._extension_repository(bpy.context.preferences)
+if repository is not None:
+    _repo_index, repo = repository
+    if not repo.use_remote_url:
+        assert addon._extension_update_info(bpy.context.preferences) is None
 assert bpy.app.handlers.undo_post.count(addon.sync_model_after_history_change) == 1
 assert bpy.app.handlers.redo_post.count(addon.sync_model_after_history_change) == 1
 assert (

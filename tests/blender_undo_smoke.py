@@ -189,20 +189,18 @@ apply_armature_context(
 split = core.split_selected_bone(session.blender_session_id)
 assert split["ok"]
 assert split["context"]["joint_names"][:3] == ["root", "root_split", "branch"]
-for edit_bone in armature_object.data.edit_bones:
-    edit_bone.select = False
-    edit_bone.select_head = False
-    edit_bone.select_tail = False
-root = armature_object.data.edit_bones["root"]
-root.select = True
-root.select_head = True
-root.select_tail = True
-armature_object.data.edit_bones.active = root
+assert split["context"]["parents"] == [-1, 0, 1, 2, 1]
+assert armature_object.data.edit_bones["branch"].parent.name == "root_split"
+assert armature_object.data.edit_bones["sibling"].parent.name == "root_split"
+assert armature_object.data.edit_bones.active.name == "root"
 dissolved = core.delete_selected_bone(session.blender_session_id)
 assert dissolved["ok"]
 assert dissolved["deleted_bone_name"] == "root_split"
 assert dissolved["delete_operation"] == "dissolve"
 assert dissolved["context"]["joint_names"] == CONTEXT["joint_names"]
+assert dissolved["context"]["parents"] == CONTEXT["parents"]
+assert armature_object.data.edit_bones["branch"].parent.name == "root"
+assert armature_object.data.edit_bones["sibling"].parent.name == "root"
 
 for edit_bone in armature_object.data.edit_bones:
     edit_bone.select = False

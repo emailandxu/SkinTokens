@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .protocol import BLENDER_SOCKET_PATH, DEFAULT_MODEL_URL, request
+from .protocol import DEFAULT_MODEL_URL, request
 
 
 def print_response(response: dict) -> None:
@@ -50,45 +50,8 @@ def model_smoke(args: argparse.Namespace) -> None:
         print_response(response)
 
 
-def blender_smoke(args: argparse.Namespace) -> None:
-    start = request(args.socket, {"command": "start", "obj_path": args.obj})
-    print_response(start)
-    if not start.get("ok"):
-        return
-    blender_session_id = start["blender_session_id"]
-    for _ in range(args.steps):
-        response = request(
-            args.socket,
-            {
-                "command": "next",
-                "blender_session_id": blender_session_id,
-                "options": {"max_new_tokens": args.max_new_tokens},
-            },
-        )
-        print_response(response)
-        if not response.get("ok"):
-            return
-        if response.get("context", {}).get("done"):
-            break
-    if args.skin:
-        response = request(
-            args.socket,
-            {
-                "command": "skin",
-                "blender_session_id": blender_session_id,
-                "output_path": args.output,
-                "options": {
-                    "midprocess": args.midprocess,
-                    "skin_num_beams": args.skin_num_beams,
-                    "skin_postprocess": args.skin_postprocess,
-                },
-            },
-        )
-        print_response(response)
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Interactive SkinTokens local client.")
+    parser = argparse.ArgumentParser(description="Interactive SkinTokens model client.")
     sub = parser.add_subparsers(dest="target", required=True)
 
     model = sub.add_parser("model", help="Talk directly to the interactive model server.")
@@ -110,26 +73,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     model.add_argument("--output", default="results/xiaobaozi_interactive_skin.txt")
     model.set_defaults(func=model_smoke)
-
-    blender = sub.add_parser("blender", help="Talk to the Blender validation server.")
-    blender.add_argument("--socket", default=str(BLENDER_SOCKET_PATH))
-    blender.add_argument("--obj", default="examples/xiaobaozi.obj")
-    blender.add_argument("--steps", type=int, default=2)
-    blender.add_argument("--max-new-tokens", type=int, default=16)
-    blender.add_argument("--skin", action="store_true")
-    blender.add_argument(
-        "--midprocess",
-        choices=["none", "similar-subtrees", "dfs-ensemble"],
-        default="dfs-ensemble",
-    )
-    blender.add_argument("--skin-num-beams", type=int, default=10)
-    blender.add_argument(
-        "--skin-postprocess",
-        choices=["none", "voxel", "latent", "vae-reconstruction"],
-        default="none",
-    )
-    blender.add_argument("--output", default="results/xiaobaozi_interactive_skin.txt")
-    blender.set_defaults(func=blender_smoke)
 
     return parser
 

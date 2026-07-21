@@ -123,6 +123,7 @@ class UsageLifecycleTest(unittest.TestCase):
             session_id=session_id,
             owner_id="anonymous-client",
             client_ip="192.0.2.10",
+            blender_extension_version="1.8.2",
             asset_id="asset",
             obj_path=Path("not-logged.obj"),
             created_at=time.time() - 1.0,
@@ -160,6 +161,8 @@ class UsageLifecycleTest(unittest.TestCase):
             ended = events[1]
             self.assertEqual(events[0]["client_ip"], "192.0.2.10")
             self.assertEqual(ended["client_ip"], "192.0.2.10")
+            self.assertEqual(events[0]["blender_extension_version"], "1.8.2")
+            self.assertEqual(ended["blender_extension_version"], "1.8.2")
             self.assertEqual(ended["end_reason"], "finish")
             self.assertEqual(ended["initial_bone_count"], 2)
             self.assertEqual(ended["final_bone_count"], 5)

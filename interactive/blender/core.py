@@ -932,8 +932,8 @@ class BlenderInteractiveCore:
 
         new_mid_index = insert_at
         new_parents = []
-        for old_index, old_parent in enumerate(parents):
-            if old_index == child:
+        for old_parent in parents:
+            if old_parent == selected:
                 new_parents.append(new_mid_index)
             elif old_parent == -1:
                 new_parents.append(-1)
@@ -962,6 +962,7 @@ class BlenderInteractiveCore:
             "blender_session_id": blender_session_id,
             "source_context": source_context,
             "mid_name": mid_name,
+            "selected_name": selected_name,
             "mode_after": self._result_mode(session),
             "split_joint_index": new_mid_index,
             "split_child_name": names[child],
@@ -978,7 +979,7 @@ class BlenderInteractiveCore:
         self._apply_context_to_armature(
             session,
             response["context"],
-            select_name=str(prepared["mid_name"]),
+            select_name=str(prepared["selected_name"]),
             remove_missing=True,
             mode_after=str(prepared["mode_after"]),
         )

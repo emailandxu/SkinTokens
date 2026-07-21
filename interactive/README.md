@@ -35,7 +35,7 @@ continuing generation.
 
 Each server session also keeps a lightweight reserved-name registry outside the
 GPU runtime cache. Current client context names are added on every request and
-are not reused after Delete. If a decoded Next/Rig name is already reserved,
+are not reused after Collapse. If a decoded Next/Rig name is already reserved,
 the server assigns the next unused `bone_N`. Runtime LRU eviction preserves
 this registry; Reset/Finish removes it with the session.
 
@@ -76,6 +76,53 @@ The server reads the configuration at startup; restart it after editing the
 file. Existing command-line options take precedence over values in the file.
 Use `--config PATH` to select a different JSON file.
 
+## Blender Extension Repository
+
+The HTTP server can publish the Blender Extension from the same address as the
+model API. The default repository directory is
+`.runtime/blender_extensions/`, configured by these fields:
+
+```json
+{
+  "blender_extensions_enabled": true,
+  "blender_extensions_dir": "blender_extensions"
+}
+```
+
+Build a new extension, copy it into the repository directory, and let Blender
+generate the signed-size/hash index:
+
+```bash
+blender --command extension build \
+  --source-dir interactive/blender \
+  --output-dir dist
+cp dist/skintokens_interactive-1.8.6.zip \
+  .runtime/blender_extensions/
+blender --command extension server-generate \
+  --repo-dir .runtime/blender_extensions
+```
+
+The server exposes the repository at
+`http://SERVER:8765/blender/extensions/`. `index.json` is not cached; versioned
+ZIP archives use immutable caching and are served outside the GPU request
+queue. Directory listing and non-ZIP downloads are disabled.
+
+Register and install it in Blender:
+
+```bash
+blender --online-mode --command extension repo-add skintokens \
+  --name "SkinTokens Blender Extensions" \
+  --url http://SERVER:8765/blender/extensions/
+blender --online-mode --command extension install \
+  --sync --enable skintokens_interactive
+```
+
+Subsequent versions can be installed with
+`blender --online-mode --command extension update --sync`. The health response reports
+whether the repository is ready and its latest `skintokens_interactive`
+version. Blender requests also send their installed Extension version for
+session usage reporting.
+
 CPU mode is available for debugging:
 
 ```bash
@@ -109,27 +156,6 @@ uv run python -m interactive.client model \
   --output results/xiaobaozi_interactive_skin.txt
 ```
 
-## Blender Validation Server
-
-Run this inside Blender's Python environment, after the model server is up:
-
-```bash
-blender --background --python-expr \
-  "import sys; sys.path.insert(0, '/path/to/SkinTokens'); import interactive.blender.server as s; s.main()"
-```
-
-Then drive it from a normal terminal:
-
-```bash
-uv run python -m interactive.client blender \
-  --obj examples/xiaobaozi.obj \
-  --steps 2
-```
-
-The validation server imports the OBJ and creates an empty working Armature on
-`start`, adds generated bones directly to that Armature on `next`/`rig`, and
-applies generated `skin` rows as mesh vertex groups after `skin`.
-
 ## Blender Addon UI
 
 ### Build The Blender 4.2+ Extension
@@ -153,7 +179,7 @@ blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
 blender --command extension validate \
-  dist/skintokens_interactive-1.8.0.zip
+  dist/skintokens_interactive-1.8.6.zip
 ```
 
 Install the ZIP with `Preferences > Extensions > Install from Disk`. Enable
@@ -241,9 +267,11 @@ Open the 3D View sidebar with `N`, then use the `SkinTokens` tab:
   explicit parent. A parent is required once the Armature is nonempty.
 - `Rig`: continue from the current skeleton until skeleton EOS, preserving all
   bones that are already present.
-- `Split`: divide the active bone's displayed downstream segment.
-- `Delete`: directly remove an active leaf; for an internal bone, dissolve its
-  displayed downstream joint and preserve that joint's children.
+- `Split`: divide the active bone's displayed downstream segment while keeping
+  the original bone active.
+- `Collapse`: directly remove an active leaf; for an internal bone, remove its
+  first downstream joint and preserve that joint's children. Immediately after
+  Split, Collapse restores the original segment and hierarchy.
 - `Skin`: generate skin for the current skeleton and apply vertex groups.
 - `VAE Level`: choose reconstruction level 0-3 for exactly one active skin
   vertex group or selected Pose/Edit bone. Level 0 is the original field.
@@ -251,7 +279,7 @@ Open the 3D View sidebar with `N`, then use the `SkinTokens` tab:
 
 Before Start creates a live Blender session, all generation and editing
 controls are disabled. `Rig` and `Skin` occupy the first operation row, followed
-by `Next` / `Force Next`, `Split` / `Delete`, and the VAE row. The state-dependent
+by `Next` / `Force Next`, `Split` / `Collapse`, and the VAE row. The state-dependent
 `Start/Finish` button is the final control at the bottom of the panel. The VAE
 slider uses most of its row and Apply is a compact checkmark. Output, generation
 parameters, and the raw Session ID are intentionally hidden. Finish cancels
@@ -261,7 +289,7 @@ Finish do not create an intermediate TXT; a failed server reset does not
 prevent local cleanup. Import TXT remains available to scripts and launch
 parameters but its path and button are intentionally hidden from the panel.
 
-Start, Next, Force Next, Rig, Skin, Split, Delete, VAE reconstruction, and
+Start, Next, Force Next, Rig, Skin, Split, Collapse, VAE reconstruction, and
 automatic Armature synchronization perform HTTP work on a daemon worker
 thread. Blender scene reads and result application remain on the main thread.
 While one request is active, plugin controls are disabled but the Blender UI
@@ -314,8 +342,8 @@ are automatically synced about 250 ms after placement. The hidden Refresh operat
 remains available to scripts. Refresh trusts Blender's current parent links, so
 native Delete keeps children that Blender reparents. Deleting a root from a
 branched rig leaves multiple roots; Refresh rejects that invalid context without
-erasing the remaining bones. The plugin Delete command provides predictable
-leaf-delete and internal-dissolve behavior without requiring connected Blender
+erasing the remaining bones. The plugin Collapse command provides predictable
+leaf-delete and downstream-collapse behavior without requiring connected Blender
 bones. Blender Undo and Redo read the restored Armature and synchronize that
 exact hierarchy to the model service without changing modes inside the undo
 callback.

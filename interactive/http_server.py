@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import threading
 import weakref
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from bottle import BaseRequest, Bottle, request, response
+from bottle import BaseRequest, Bottle, request, response, static_file
 
 from .asset_store import MeshAssetStore
 from .protocol import RUNTIME_DIR, Request, Response, err
@@ -29,6 +31,9 @@ from .server_config import DEFAULT_SERVER_CONFIG_PATH, parse_args_with_config
 
 DEFAULT_ASSET_DIR = RUNTIME_DIR / "interactive_assets"
 DEFAULT_RESULT_DIR = RUNTIME_DIR / "interactive_results"
+DEFAULT_BLENDER_EXTENSIONS_DIR = RUNTIME_DIR / "blender_extensions"
+BLENDER_EXTENSIONS_PATH = "/blender/extensions/"
+BLENDER_EXTENSION_ARCHIVE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.zip$")
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -43,12 +48,20 @@ class InteractiveHttpApi:
         result_dir: str | Path,
         max_upload_bytes: int,
         max_pending_gpu_requests: int,
+        blender_extensions_dir: str | Path | None = None,
     ) -> None:
         self.service = service
         self.asset_store = asset_store
         self.result_dir = Path(result_dir).expanduser().resolve()
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.max_upload_bytes = max(1, int(max_upload_bytes))
+        self.blender_extensions_dir = (
+            None
+            if blender_extensions_dir is None
+            else Path(blender_extensions_dir).expanduser().resolve()
+        )
+        if self.blender_extensions_dir is not None:
+            self.blender_extensions_dir.mkdir(parents=True, exist_ok=True)
         BaseRequest.MEMFILE_MAX = max(
             int(BaseRequest.MEMFILE_MAX),
             self.max_upload_bytes,
@@ -72,6 +85,63 @@ class InteractiveHttpApi:
     def _session_lock(self, session_id: str) -> threading.Lock:
         with self.session_locks_guard:
             return self.session_locks.setdefault(session_id, threading.Lock())
+
+    def _blender_extensions_status(self) -> dict:
+        root = self.blender_extensions_dir
+        index_path = None if root is None else root / "index.json"
+        status = {
+            "enabled": root is not None,
+            "ready": bool(index_path is not None and index_path.is_file()),
+            "repository_path": BLENDER_EXTENSIONS_PATH,
+            "package_id": "skintokens_interactive",
+            "latest_version": None,
+        }
+        if index_path is None or not index_path.is_file():
+            return status
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            packages = [
+                item
+                for item in index.get("data", [])
+                if isinstance(item, dict)
+                and item.get("id") == "skintokens_interactive"
+            ]
+            if packages:
+                status["latest_version"] = max(
+                    (str(item.get("version", "")) for item in packages),
+                    key=self._extension_version_key,
+                )
+        except (OSError, ValueError, TypeError):
+            status["ready"] = False
+        return status
+
+    @staticmethod
+    def _extension_version_key(version: str) -> tuple:
+        numbers = tuple(int(value) for value in re.findall(r"\d+", version)[:3])
+        numbers = (numbers + (0, 0, 0))[:3]
+        return (*numbers, 0 if "-" in version else 1, version)
+
+    def _serve_blender_extension_file(self, filename: str, *, index: bool = False):
+        root = self.blender_extensions_dir
+        valid_archive = bool(BLENDER_EXTENSION_ARCHIVE.fullmatch(filename))
+        if root is None or (filename != "index.json" and not valid_archive):
+            response.status = 404
+            return err("Blender extension file not found", code="NOT_FOUND")
+        path = root / filename
+        if not path.is_file():
+            response.status = 404
+            return err("Blender extension file not found", code="NOT_FOUND")
+        served = static_file(
+            filename,
+            root=str(root),
+            mimetype="application/json" if index else "application/zip",
+        )
+        served.set_header("X-Content-Type-Options", "nosniff")
+        served.set_header(
+            "Cache-Control",
+            "no-cache" if index else "public, max-age=31536000, immutable",
+        )
+        return served
 
     @staticmethod
     def _set_status(payload: Response) -> Response:
@@ -128,7 +198,20 @@ class InteractiveHttpApi:
 
         @app.get("/health")
         def health() -> Response:
-            return self._set_status(self.service.status())
+            payload = self.service.status()
+            payload["blender_extensions"] = self._blender_extensions_status()
+            return self._set_status(payload)
+
+        def extension_index():
+            return self._serve_blender_extension_file("index.json", index=True)
+
+        app.get("/blender/extensions", callback=extension_index)
+        app.get("/blender/extensions/", callback=extension_index)
+        app.get("/blender/extensions/index.json", callback=extension_index)
+
+        @app.get("/blender/extensions/<filename>")
+        def extension_archive(filename: str):
+            return self._serve_blender_extension_file(filename)
 
         @app.post("/v1/sessions")
         def start() -> Response:
@@ -158,6 +241,10 @@ class InteractiveHttpApi:
                     "asset_id": asset.asset_id,
                     "owner_id": self._owner_id(),
                     "client_ip": self._client_ip(),
+                    "blender_extension_version": request.headers.get(
+                        "X-SkinTokens-Blender-Extension-Version",
+                        "unknown",
+                    ),
                     "initial_bone_count": initial_bone_count,
                 },
                 gpu=True,
@@ -224,6 +311,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--asset-dir", default=str(DEFAULT_ASSET_DIR))
     parser.add_argument("--result-dir", default=str(DEFAULT_RESULT_DIR))
+    parser.add_argument(
+        "--blender-extensions-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--blender-extensions-dir",
+        default=str(DEFAULT_BLENDER_EXTENSIONS_DIR),
+    )
     parser.add_argument("--max-runtime-sessions", type=int, default=8)
     parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     parser.add_argument(
@@ -267,6 +363,11 @@ def serve(args: argparse.Namespace) -> None:
         result_dir=args.result_dir,
         max_upload_bytes=args.max_upload_mb * 1024 * 1024,
         max_pending_gpu_requests=args.max_pending_gpu_requests,
+        blender_extensions_dir=(
+            args.blender_extensions_dir
+            if args.blender_extensions_enabled
+            else None
+        ),
     )
     print(f"[interactive] HTTP model server listening on http://{args.host}:{args.port}")
     try:

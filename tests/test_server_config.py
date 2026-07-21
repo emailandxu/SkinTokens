@@ -22,6 +22,11 @@ class ServerConfigTest(unittest.TestCase):
             self.assertEqual(config["max_runtime_sessions"], 8)
             self.assertEqual(config["max_sessions"], 512)
             self.assertEqual(config["usage_dir"], str(Path(temporary) / "usage"))
+            self.assertTrue(config["blender_extensions_enabled"])
+            self.assertEqual(
+                config["blender_extensions_dir"],
+                str(Path(temporary) / "blender_extensions"),
+            )
 
     def test_config_supplies_defaults_and_cli_still_wins(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

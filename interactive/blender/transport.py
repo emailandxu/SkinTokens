@@ -13,9 +13,9 @@ from urllib.request import urlopen
 import numpy as np
 
 
-DEFAULT_MODEL_URL = "http://127.0.0.1:8765"
+DEFAULT_MODEL_URL = "http://172.17.60.251:8765"
 PROTOCOL_VERSION = 1
-EXTENSION_VERSION = "1.8.0"
+EXTENSION_VERSION = "1.8.6"
 
 Request = Dict[str, Any]
 Response = Dict[str, Any]
@@ -71,7 +71,10 @@ def request(
         raise ValueError("server URL must start with http:// or https://")
     command = str(payload.get("command", ""))
     owner_id = str(payload.get("owner_id", "anonymous"))
-    headers = {"X-SkinTokens-Owner": owner_id}
+    headers = {
+        "X-SkinTokens-Owner": owner_id,
+        "X-SkinTokens-Blender-Extension-Version": EXTENSION_VERSION,
+    }
 
     if command == "start":
         obj_path = Path(str(payload["obj_path"])).expanduser().resolve()
