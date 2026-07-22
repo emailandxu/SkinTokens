@@ -12,7 +12,7 @@ import numpy as np
 matches = [
     name
     for name in bpy.context.preferences.addons.keys()
-    if name.endswith(".skintokens_interactive")
+    if name.endswith(".h3d_skintokens")
 ]
 assert len(matches) == 1, matches
 package_name = matches[0]
@@ -22,7 +22,10 @@ apply_skin = importlib.import_module(f"{package_name}.apply_skin")
 transport = importlib.import_module(f"{package_name}.transport")
 
 assert addon.__package__ == package_name
-assert transport.EXTENSION_VERSION == "1.8.6"
+assert transport.EXTENSION_PACKAGE_ID == "h3d_skintokens"
+assert transport.EXTENSION_VERSION == "1.0.0"
+assert addon.SKINTOKENS_PT_interactive.bl_label == "H3D Skintokens"
+assert addon.SKINTOKENS_PT_interactive.bl_category == "H3D Skintokens"
 assert hasattr(bpy.types.Scene, "skintokens_status")
 assert str(
     bpy.context.preferences.addons[package_name].preferences.server_url

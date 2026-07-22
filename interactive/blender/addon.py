@@ -16,6 +16,7 @@ import bpy  # type: ignore
 from bpy.app.handlers import persistent  # type: ignore
 
 from .apply_skin import (
+    capture_armature_bone_states,
     parse_armature_object,
     promote_active_armature_bone_selection,
     selected_skin_bone_names,
@@ -23,9 +24,15 @@ from .apply_skin import (
 from .core import (
     DEFAULT_VAE_RECONSTRUCTION_MAX_LEVEL,
     BlenderInteractiveCore,
+    same_armature_bone_states,
     same_skeleton_context,
 )
-from .transport import DEFAULT_MODEL_URL, EXTENSION_VERSION
+from .transport import (
+    DEFAULT_MODEL_URL,
+    EXTENSION_PACKAGE_ID,
+    EXTENSION_VERSION,
+    request as transport_request,
+)
 
 
 _CORE: BlenderInteractiveCore | None = None
@@ -44,13 +51,16 @@ _ARMATURE_WATCH_INTERVAL = 0.15
 _DEBUG_LOG_PATH = Path(tempfile.gettempdir()) / "skintokens_interactive_debug.log"
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
-_EXTENSION_PACKAGE_ID = "skintokens_interactive"
+_EXTENSION_PACKAGE_ID = EXTENSION_PACKAGE_ID
 _SEMVER_PATTERN = re.compile(
     r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
 )
 _UPDATE_INDEX_CACHE: dict | None = None
 _UPDATE_SYNC_START_TIMER_REGISTERED = False
 _UPDATE_SYNC_POLL_TIMER_REGISTERED = False
+_EXTENSION_EVENT_JOB: dict | None = None
+_EXTENSION_EVENT_START_TIMER_REGISTERED = False
+_EXTENSION_EVENT_POLL_TIMER_REGISTERED = False
 
 
 def _debug_log(event: str, **fields) -> None:
@@ -112,25 +122,32 @@ class SKINTOKENS_Preferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     server_url: bpy.props.StringProperty(
-        name="Server URL",
-        description="SkinTokens interactive model service",
+        name="服务器地址",
+        description="SkinTokens 模型服务地址",
         default=DEFAULT_MODEL_URL,
     )
     request_timeout: bpy.props.FloatProperty(
-        name="Request Timeout",
-        description="Maximum time to wait for one model request",
+        name="请求超时",
+        description="单次模型请求的最长等待时间",
         default=300.0,
         min=10.0,
         max=3600.0,
         subtype="TIME",
     )
+    installation_id: bpy.props.StringProperty(default="", options={"HIDDEN"})
+    reported_extension_version: bpy.props.StringProperty(
+        default="",
+        options={"HIDDEN"},
+    )
 
     def draw(self, _context) -> None:
         layout = self.layout
-        layout.prop(self, "server_url")
+        server_row = layout.row()
+        server_row.enabled = False
+        server_row.prop(self, "server_url")
         layout.prop(self, "request_timeout")
         layout.operator("skintokens_interactive.test_connection", icon="URL")
-        layout.label(text=f"Extension {EXTENSION_VERSION}")
+        layout.label(text=f"插件版本 {EXTENSION_VERSION}")
 
 
 def get_addon_preferences(context):
@@ -162,7 +179,7 @@ def get_core(context) -> BlenderInteractiveCore:
         )
     )
     if changed and _CORE.sessions:
-        raise RuntimeError("Finish the active SkinTokens session before changing server settings")
+        raise RuntimeError("请先结束当前 SkinTokens 会话，再修改服务器设置")
     if _CORE is None or changed:
         _CORE = BlenderInteractiveCore(
             model_socket=endpoint,
@@ -174,7 +191,7 @@ def get_core(context) -> BlenderInteractiveCore:
 
 def set_status(context, message: str) -> None:
     context.scene.skintokens_status = message
-    print(f"[SkinTokens Interactive] {message}")
+    print(f"[H3D Skintokens] {message}")
 
 
 def online_access_enabled() -> bool:
@@ -411,6 +428,121 @@ def _background_future(work: Callable[[], dict], *, name: str) -> Future:
     return future
 
 
+def _extension_installation_source(preferences) -> str:
+    repository = _extension_repository(preferences)
+    if repository is None:
+        return "disk"
+    _repo_index, repo = repository
+    return "repository" if repo.use_remote_url else "disk"
+
+
+def _poll_extension_event_report() -> float | None:
+    global _EXTENSION_EVENT_JOB, _EXTENSION_EVENT_POLL_TIMER_REGISTERED
+    job = _EXTENSION_EVENT_JOB
+    if job is None:
+        _EXTENSION_EVENT_POLL_TIMER_REGISTERED = False
+        return None
+    future = job["future"]
+    if not future.done():
+        return 0.1
+    try:
+        result = future.result()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "扩展事件上报失败"))
+        preferences = get_addon_preferences(bpy.context)
+        if preferences is not None:
+            preferences.reported_extension_version = str(job["version"])
+        _debug_log(
+            "extension.event_reported",
+            action=str(job["action"]),
+            version=str(job["version"]),
+        )
+    except Exception as exc:
+        _debug_log("extension.event_report_failed", error=str(exc))
+    finally:
+        _EXTENSION_EVENT_JOB = None
+        _EXTENSION_EVENT_POLL_TIMER_REGISTERED = False
+    return None
+
+
+def _start_extension_event_report() -> float | None:
+    global _EXTENSION_EVENT_JOB, _EXTENSION_EVENT_START_TIMER_REGISTERED
+    global _EXTENSION_EVENT_POLL_TIMER_REGISTERED
+    _EXTENSION_EVENT_START_TIMER_REGISTERED = False
+    if _EXTENSION_EVENT_JOB is not None or not online_access_enabled():
+        return None
+    preferences = get_addon_preferences(bpy.context)
+    if preferences is None:
+        return None
+    previous_version = str(preferences.reported_extension_version).strip()
+    if previous_version == EXTENSION_VERSION:
+        return None
+    installation_id = str(preferences.installation_id).strip()
+    if not installation_id:
+        installation_id = uuid.uuid4().hex
+        preferences.installation_id = installation_id
+    action = "install" if not previous_version else "update"
+    endpoint = preferences.server_url.strip() or DEFAULT_MODEL_URL
+    owner_id = installation_id
+    payload = {
+        "command": "extension_event",
+        "owner_id": owner_id,
+        "action": action,
+        "package_id": _EXTENSION_PACKAGE_ID,
+        "extension_version": EXTENSION_VERSION,
+        "previous_version": previous_version,
+        "blender_version": ".".join(str(value) for value in bpy.app.version),
+        "installation_id": installation_id,
+        "installation_source": _extension_installation_source(
+            bpy.context.preferences
+        ),
+    }
+    _EXTENSION_EVENT_JOB = {
+        "action": action,
+        "version": EXTENSION_VERSION,
+        "future": _background_future(
+            lambda: transport_request(
+                endpoint,
+                payload,
+                timeout=min(15.0, float(preferences.request_timeout)),
+            ),
+            name="h3d-skintokens-extension-event",
+        ),
+    }
+    if not _EXTENSION_EVENT_POLL_TIMER_REGISTERED:
+        _EXTENSION_EVENT_POLL_TIMER_REGISTERED = True
+        bpy.app.timers.register(
+            _poll_extension_event_report,
+            first_interval=0.1,
+        )
+    return None
+
+
+def _schedule_extension_event_report(delay: float = 1.0) -> None:
+    global _EXTENSION_EVENT_START_TIMER_REGISTERED
+    if _EXTENSION_EVENT_START_TIMER_REGISTERED or _EXTENSION_EVENT_JOB is not None:
+        return
+    _EXTENSION_EVENT_START_TIMER_REGISTERED = True
+    bpy.app.timers.register(
+        _start_extension_event_report,
+        first_interval=max(0.0, float(delay)),
+    )
+
+
+def _cancel_extension_event_report() -> None:
+    global _EXTENSION_EVENT_JOB, _EXTENSION_EVENT_START_TIMER_REGISTERED
+    global _EXTENSION_EVENT_POLL_TIMER_REGISTERED
+    for callback in (
+        _start_extension_event_report,
+        _poll_extension_event_report,
+    ):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
+    _EXTENSION_EVENT_JOB = None
+    _EXTENSION_EVENT_START_TIMER_REGISTERED = False
+    _EXTENSION_EVENT_POLL_TIMER_REGISTERED = False
+
+
 def _poll_async_job() -> float | None:
     global _ASYNC_JOB, _ASYNC_POLL_REGISTERED
     job = _ASYNC_JOB
@@ -426,7 +558,7 @@ def _poll_async_job() -> float | None:
         background_result = future.result()
         response = job["apply"](background_result)
         if not response.get("ok"):
-            raise RuntimeError(response.get("error", "request failed"))
+            raise RuntimeError(response.get("error", "请求失败"))
         job["success"](context, response)
         undo_label = job.get("undo_label")
         if undo_label:
@@ -436,7 +568,7 @@ def _poll_async_job() -> float | None:
                 traceback.print_exc()
     except Exception as exc:
         traceback.print_exc()
-        set_status(context, f"{job['label']} failed: {exc}")
+        set_status(context, f"{job['label']}失败：{exc}")
     finally:
         _ASYNC_JOB = None
         _ASYNC_POLL_REGISTERED = False
@@ -455,7 +587,7 @@ def submit_async(
 ) -> bool:
     global _ASYNC_JOB, _ASYNC_POLL_REGISTERED
     if async_busy():
-        set_status(context, f"{_ASYNC_JOB['label']} is still running")
+        set_status(context, f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
         return False
     _ASYNC_JOB = {
         "label": label,
@@ -464,7 +596,7 @@ def submit_async(
         "success": success,
         "undo_label": undo_label,
     }
-    set_status(context, f"{label}...")
+    set_status(context, f"{label}中...")
     if not _ASYNC_POLL_REGISTERED:
         _ASYNC_POLL_REGISTERED = True
         bpy.app.timers.register(_poll_async_job, first_interval=0.05)
@@ -486,7 +618,7 @@ def _apply_context_result(
         return {
             "ok": False,
             "code": "STALE_RESULT",
-            "error": "Armature changed while the request was running; result discarded",
+            "error": "请求执行期间骨架发生变化，结果已丢弃",
         }
     return apply_result(prepared, response)
 
@@ -550,20 +682,20 @@ def _report_vae_result(context, response: dict, bone_name: str) -> None:
     report = response.get("vae_reconstruction") or {}
     if response.get("generated"):
         detail = (
-            f"generated levels 0-{response.get('max_level', 3)} "
-            f"in {float(report.get('wall_sec', 0.0)):.2f}s"
+            f"已生成 0-{response.get('max_level', 3)} 级，"
+            f"耗时 {float(report.get('wall_sec', 0.0)):.2f} 秒"
         )
     else:
-        detail = "cached"
+        detail = "使用缓存"
     reset = (
-        ", cache reset after weight edit"
+        "，权重编辑后缓存已重置"
         if response.get("cache_invalidated")
         else ""
     )
     set_status(
         context,
-        f"VAE {response.get('bone_name', bone_name)} level "
-        f"{response.get('level', 0)}: {detail}{reset}",
+        f"骨骼 {response.get('bone_name', bone_name)} 的权重场递归重建级别 "
+        f"{response.get('level', 0)}：{detail}{reset}",
     )
 
 
@@ -575,14 +707,14 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
     context = bpy.context
     try:
         if async_busy():
-            raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+            raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
         session_id = context.scene.skintokens_blender_session_id
         if not session_id:
-            raise RuntimeError("Start a session first")
+            raise RuntimeError("请先开始会话")
         bone_name = selected_vae_bone_name(context)
         if bone_name is None:
             raise RuntimeError(
-                "Activate one skin vertex group or select exactly one pose bone"
+                "请激活一个蒙皮顶点组，或只选择一根骨骼"
             )
         core = get_core(context)
         prepared = core.prepare_vae_reconstruction_level(
@@ -590,11 +722,11 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
             int(value),
         )
         if not prepared.get("ok"):
-            raise RuntimeError(prepared.get("error", "VAE reconstruction failed"))
+            raise RuntimeError(prepared.get("error", "VAE 重建失败"))
         if not prepared["needs_remote"]:
             response = core._apply_vae_level(prepared)
             if not response.get("ok"):
-                raise RuntimeError(response.get("error", "VAE reconstruction failed"))
+                raise RuntimeError(response.get("error", "VAE 重建失败"))
             _report_vae_result(context, response, bone_name)
             return
 
@@ -614,8 +746,7 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
                     "ok": False,
                     "code": "STALE_RESULT",
                     "error": (
-                        "Armature or weights changed while VAE was running; "
-                        "result discarded"
+                        "VAE 重建期间骨架或权重发生变化，结果已丢弃"
                     ),
                 }
             return core._apply_vae_level(
@@ -626,7 +757,7 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
 
         submit_async(
             context,
-            label="VAE reconstruction",
+            label="VAE 重建",
             work=lambda: core.execute_vae_request(prepared),
             apply=apply_vae,
             success=lambda result_context, response: _report_vae_result(
@@ -637,7 +768,7 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
         )
     except Exception as exc:
         traceback.print_exc()
-        set_status(context, f"VAE level failed: {exc}")
+        set_status(context, f"权重场递归重建切换失败：{exc}")
     finally:
         _VAE_LEVEL_SETTING = False
 
@@ -646,25 +777,25 @@ def selected_start_objects(context):
     active = context.object
     selected = list(context.selected_objects)
     if active is None:
-        raise RuntimeError("Select a mesh, or select a mesh together with an armature")
+        raise RuntimeError("请选择一个网格，或同时选择网格和骨架")
 
     selected_meshes = [obj for obj in selected if obj.type == "MESH"]
     selected_armatures = [obj for obj in selected if obj.type == "ARMATURE"]
     if active.type == "MESH":
         mesh_obj = active
         if len(selected_armatures) > 1:
-            raise RuntimeError("Select at most one armature for Start")
+            raise RuntimeError("开始时最多只能选择一个骨架")
         armature_obj = selected_armatures[0] if selected_armatures else None
         return mesh_obj, armature_obj
 
     if active.type == "ARMATURE":
         if len(selected_meshes) != 1:
             raise RuntimeError(
-                "Select exactly one target mesh together with the active armature"
+                "请为当前骨架同时选择一个目标网格"
             )
         return selected_meshes[0], active
 
-    raise RuntimeError("Start requires a mesh and optionally one armature")
+    raise RuntimeError("开始会话需要一个网格，也可以同时选择一个骨架")
 
 
 def export_selected_obj(context, obj) -> Path:
@@ -686,6 +817,38 @@ def source_obj_path(context, obj) -> Path:
         if path.exists():
             return path
     return export_selected_obj(context, obj)
+
+
+def _clear_stale_sessions_before_start(context, core: BlenderInteractiveCore) -> None:
+    stale_ids = set(core.sessions)
+    for obj in bpy.data.objects:
+        marker = obj.get("skintokens_blender_session_id")
+        if marker:
+            stale_ids.add(str(marker))
+    if not stale_ids:
+        return
+    cancel_history_sync()
+    cancel_armature_watch()
+    for session_id in sorted(stale_ids):
+        if session_id in core.sessions:
+            try:
+                payload = core.detach_session(
+                    session_id,
+                    end_reason="start_replaced",
+                )
+                _submit_server_cleanup(core, payload)
+            except Exception:
+                traceback.print_exc()
+    context.scene.skintokens_blender_session_id = ""
+    for obj in bpy.data.objects:
+        if obj.get("skintokens_blender_session_id") not in stale_ids:
+            continue
+        for key in (
+            "skintokens_blender_session_id",
+            "skintokens_model_session_id",
+        ):
+            if key in obj:
+                del obj[key]
 
 
 def _flush_history_sync() -> float | None:
@@ -721,7 +884,7 @@ def _flush_history_sync() -> float | None:
         if not prepared.get("ok"):
             set_status(
                 bpy.context,
-                f"Armature sync failed: {prepared.get('error')}",
+                f"骨架同步失败：{prepared.get('error')}",
             )
             return None
         if not prepared.get("needs_remote"):
@@ -746,7 +909,7 @@ def _flush_history_sync() -> float | None:
         def succeeded(result_context, response: dict) -> None:
             if response.get("stale"):
                 _debug_log("history.stale", session_id=session_id)
-                set_status(result_context, "Armature changed again; resync pending")
+                set_status(result_context, "骨架再次发生变化，等待重新同步")
                 return
             count = len(response.get("context", {}).get("joints", []))
             _debug_log(
@@ -755,11 +918,11 @@ def _flush_history_sync() -> float | None:
                 joint_count=count,
                 joints=response.get("context", {}).get("joints", []),
             )
-            set_status(result_context, f"Armature auto-synced: {count} joints")
+            set_status(result_context, f"骨架已自动同步：{count} 根骨骼")
 
         submit_async(
             bpy.context,
-            label="Armature sync",
+            label="骨架同步",
             work=lambda: core.execute_session_request(prepared["remote"]),
             apply=apply_sync,
             success=succeeded,
@@ -767,7 +930,7 @@ def _flush_history_sync() -> float | None:
     except Exception as exc:
         _debug_log("history.failed", session_id=session_id, error=str(exc))
         traceback.print_exc()
-        set_status(bpy.context, f"Armature sync failed: {exc}")
+        set_status(bpy.context, f"骨架同步失败：{exc}")
     finally:
         _HISTORY_SYNCING = False
     return None
@@ -837,7 +1000,11 @@ def _watch_active_armature() -> float | None:
         "parents": parents,
         "joint_names": names,
     }
-    signature = _armature_context_signature(current)
+    current_bone_states = capture_armature_bone_states(armature_obj)
+    signature = (
+        _armature_context_signature(current),
+        tuple(sorted(current_bone_states.items())),
+    )
     if session_id != _ARMATURE_WATCH_SESSION_ID:
         _ARMATURE_WATCH_SESSION_ID = session_id
         _ARMATURE_WATCH_SIGNATURE = signature
@@ -859,7 +1026,16 @@ def _watch_active_armature() -> float | None:
         return _ARMATURE_WATCH_INTERVAL
 
     if (
-        not same_skeleton_context(session.context, current)
+        (
+            not same_skeleton_context(session.context, current)
+            or (
+                bool(session.bone_edit_snapshot)
+                and not same_armature_bone_states(
+                    session.bone_edit_snapshot,
+                    current_bone_states,
+                )
+            )
+        )
         and not _HISTORY_SYNC_PENDING
         and not _HISTORY_SYNCING
     ):
@@ -973,8 +1149,8 @@ def _submit_server_cleanup(core: BlenderInteractiveCore, payload: dict) -> None:
             response = done.result()
             if not response.get("ok"):
                 print(
-                    "[SkinTokens Interactive] Server cleanup failed: "
-                    f"{response.get('error', 'reset failed')}"
+                    "[H3D Skintokens] 服务端清理失败："
+                    f"{response.get('error', '重置失败')}"
                 )
         except Exception:
             traceback.print_exc()
@@ -999,10 +1175,10 @@ def _generation_options(scene, *, skin: bool = False) -> dict:
 
 def _schedule_next(context, *, force_parent: bool) -> bool:
     if async_busy():
-        raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+        raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
     session_id = context.scene.skintokens_blender_session_id
     if not session_id:
-        raise RuntimeError("Start a session first")
+        raise RuntimeError("请先开始会话")
     core = get_core(context)
     prepared = core.prepare_next(
         session_id,
@@ -1010,17 +1186,17 @@ def _schedule_next(context, *, force_parent: bool) -> bool:
         **_generation_options(context.scene),
     )
     if not prepared.get("ok"):
-        raise RuntimeError(prepared.get("error", "next failed"))
+        raise RuntimeError(prepared.get("error", "衍生骨骼失败"))
 
     def succeeded(result_context, response: dict) -> None:
         count = len(response.get("context", {}).get("joints", []))
         done = bool(response.get("context", {}).get("done", False))
-        prefix = "Forced child. Joints" if force_parent else "Generated joints"
-        set_status(result_context, f"{prefix}: {count}{' (done)' if done else ''}")
+        prefix = "已强制衍生子骨骼" if force_parent else "已衍生骨骼"
+        set_status(result_context, f"{prefix}：共 {count} 根骨骼{'，已完成' if done else ''}")
 
     return submit_async(
         context,
-        label="Force Next" if force_parent else "Next",
+        label="强制衍生子骨骼" if force_parent else "衍生骨骼",
         work=lambda: core.execute_session_request(prepared["remote"]),
         apply=lambda result: _apply_context_result(
             core,
@@ -1029,22 +1205,22 @@ def _schedule_next(context, *, force_parent: bool) -> bool:
             core.apply_next_request,
         ),
         success=succeeded,
-        undo_label="SkinTokens Force Next" if force_parent else "SkinTokens Next",
+        undo_label="SkinTokens 强制衍生子骨骼" if force_parent else "SkinTokens 衍生骨骼",
     )
 
 
 def _schedule_rig(context) -> bool:
     if async_busy():
-        raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+        raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
     session_id = context.scene.skintokens_blender_session_id
     if not session_id:
-        raise RuntimeError("Start a session first")
+        raise RuntimeError("请先开始会话")
     core = get_core(context)
     options = _generation_options(context.scene)
     options.pop("max_new_tokens", None)
     prepared = core.prepare_rig(session_id, **options)
     if not prepared.get("ok"):
-        raise RuntimeError(prepared.get("error", "rig generation failed"))
+        raise RuntimeError(prepared.get("error", "生成骨骼树失败"))
 
     def succeeded(result_context, response: dict) -> None:
         result_skeleton = response.get("context", {})
@@ -1052,12 +1228,12 @@ def _schedule_rig(context) -> bool:
         done = bool(result_skeleton.get("done", False))
         set_status(
             result_context,
-            f"Rig continuation: {count} joints{' (complete)' if done else ''}",
+            f"骨架生成完成：共 {count} 根骨骼{'，已结束' if done else ''}",
         )
 
     return submit_async(
         context,
-        label="Rig",
+        label="生成骨骼树",
         work=lambda: core.execute_session_request(prepared["remote"]),
         apply=lambda result: _apply_context_result(
             core,
@@ -1066,23 +1242,23 @@ def _schedule_rig(context) -> bool:
             core.apply_rig_request,
         ),
         success=succeeded,
-        undo_label="SkinTokens Rig",
+        undo_label="SkinTokens 生成骨骼树",
     )
 
 
 def _schedule_skin(context) -> bool:
     if async_busy():
-        raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+        raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
     session_id = context.scene.skintokens_blender_session_id
     if not session_id:
-        raise RuntimeError("Start a session first")
+        raise RuntimeError("请先开始会话")
     core = get_core(context)
     prepared = core.prepare_skin(
         session_id,
         **_generation_options(context.scene, skin=True),
     )
     if not prepared.get("ok"):
-        raise RuntimeError(prepared.get("error", "skin failed"))
+        raise RuntimeError(prepared.get("error", "生成蒙皮失败"))
 
     def apply_skin(result: dict) -> dict:
         response = core.apply_session_request(
@@ -1097,33 +1273,29 @@ def _schedule_skin(context) -> bool:
                 "ok": False,
                 "code": "STALE_RESULT",
                 "error": (
-                    "Armature changed while Skin was running; result discarded"
+                    "蒙皮生成期间骨架发生变化，结果已丢弃"
                 ),
             }
         return core._apply_skin_response(prepared, response, result["skin"])
 
     def succeeded(result_context, response: dict) -> None:
         ensemble = response.get("skin_ensemble") or {}
-        ensemble_detail = ""
         if ensemble:
-            ensemble_detail = (
-                f", selected={ensemble.get('selected_candidate')}"
-                f", candidates={ensemble.get('candidate_count')}"
+            message = (
+                f"蒙皮生成完成：已从 {ensemble.get('candidate_count')} 个候选中"
+                f"选择第 {ensemble.get('selected_candidate')} 个"
             )
-        set_status(
-            result_context,
-            "Skin complete "
-            f"[midprocess={response.get('midprocess')}"
-            f"{ensemble_detail}]",
-        )
+        else:
+            message = "蒙皮生成完成"
+        set_status(result_context, message)
 
     return submit_async(
         context,
-        label="Skin",
+        label="生成蒙皮",
         work=lambda: core.execute_skin_request(prepared),
         apply=apply_skin,
         success=succeeded,
-        undo_label="SkinTokens Skin",
+        undo_label="SkinTokens 生成蒙皮",
     )
 
 
@@ -1136,7 +1308,7 @@ def _schedule_context_edit(
     success: Callable[[object, dict], None],
 ) -> bool:
     if not prepared.get("ok"):
-        raise RuntimeError(prepared.get("error", f"{label} failed"))
+        raise RuntimeError(prepared.get("error", f"{label}失败"))
     core = get_core(context)
     return submit_async(
         context,
@@ -1155,13 +1327,13 @@ def _schedule_context_edit(
 
 class SKINTOKENS_OT_test_connection(bpy.types.Operator):
     bl_idname = "skintokens_interactive.test_connection"
-    bl_label = "Test Connection"
-    bl_description = "Check the model server and protocol version"
+    bl_label = "测试连接"
+    bl_description = "检查模型服务器及协议版本"
 
     @classmethod
     def poll(cls, _context):
         if not online_access_enabled():
-            cls.poll_message_set("Enable Online Access first")
+            cls.poll_message_set("请先允许 Blender 联网")
             return False
         return True
 
@@ -1185,15 +1357,16 @@ class SKINTOKENS_OT_test_connection(bpy.types.Operator):
             )
             response = core.server_status()
             if not response.get("ok"):
-                raise RuntimeError(response.get("error", "connection failed"))
+                raise RuntimeError(response.get("error", "连接失败"))
             message = (
-                f"Connected to SkinTokens server {response.get('server_version', 'unknown')}"
+                f"已连接 SkinTokens 服务器，版本 "
+                f"{response.get('server_version', '未知')}"
             )
             self.report({"INFO"}, message)
             set_status(context, message)
             return {"FINISHED"}
         except Exception as exc:
-            message = f"Connection failed: {exc}"
+            message = f"连接失败：{exc}"
             self.report({"ERROR"}, message)
             set_status(context, message)
             return {"CANCELLED"}
@@ -1201,17 +1374,17 @@ class SKINTOKENS_OT_test_connection(bpy.types.Operator):
 
 class SKINTOKENS_OT_enable_online_access(bpy.types.Operator):
     bl_idname = "skintokens_interactive.enable_online_access"
-    bl_label = "Allow Online Access"
-    bl_description = "Allow extensions such as SkinTokens to connect to network services"
+    bl_label = "允许联网"
+    bl_description = "允许 SkinTokens 等扩展连接网络服务"
 
     @classmethod
     def poll(cls, _context):
         if online_access_enabled():
-            cls.poll_message_set("Online Access is already enabled")
+            cls.poll_message_set("Blender 已允许联网")
             return False
         if online_access_forced_off():
             cls.poll_message_set(
-                "Blender was launched with --offline-mode and must be restarted"
+                "Blender 以 --offline-mode 启动，需要重启"
             )
             return False
         return True
@@ -1219,25 +1392,27 @@ class SKINTOKENS_OT_enable_online_access(bpy.types.Operator):
     def execute(self, context):
         context.preferences.system.use_online_access = True
         if not online_access_enabled():
-            self.report({"ERROR"}, "Blender did not enable Online Access")
+            self.report({"ERROR"}, "无法启用 Blender 联网权限")
             return {"CANCELLED"}
-        set_status(context, "Online Access enabled")
+        set_status(context, "已允许 Blender 联网")
         _schedule_extension_repository_sync(delay=0.0)
+        _schedule_extension_event_report(delay=0.0)
         return {"FINISHED"}
 
 
 class SKINTOKENS_OT_start(bpy.types.Operator):
     bl_idname = "skintokens_interactive.start"
-    bl_label = "Start"
-    bl_description = "Create a SkinTokens interactive session for the selected mesh"
+    bl_label = "开始"
+    bl_description = "为选中的网格创建 SkinTokens 交互会话"
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             obj, armature_obj = selected_start_objects(context)
             obj_path = source_obj_path(context, obj)
             core = get_core(context)
+            _clear_stale_sessions_before_start(context, core)
             prepared = core.prepare_start(
                 obj_path,
                 import_mesh=False,
@@ -1252,13 +1427,13 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                 num_beams=context.scene.skintokens_num_beams,
             )
             if not prepared.get("ok"):
-                raise RuntimeError(prepared.get("error", "start failed"))
+                raise RuntimeError(prepared.get("error", "开始会话失败"))
             obj_name = str(obj.name)
 
             def start_succeeded(result_context, response: dict) -> None:
                 mesh_obj = bpy.data.objects.get(obj_name)
                 if mesh_obj is None:
-                    raise RuntimeError("source mesh was removed while Start was running")
+                    raise RuntimeError("开始会话期间源网格已被删除")
                 result_context.scene.skintokens_blender_session_id = response[
                     "blender_session_id"
                 ]
@@ -1278,10 +1453,10 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                 if response.get("context_source") == "scene-armature":
                     set_status(
                         result_context,
-                        f"Started with scene armature: {joint_count} joints",
+                        f"会话已开始，已载入场景骨架：{joint_count} 根骨骼",
                     )
                 else:
-                    set_status(result_context, "Started with empty Armature")
+                    set_status(result_context, "会话已开始，已创建空骨架")
                 ensure_armature_watch()
 
             def apply_start(result: dict) -> dict:
@@ -1305,8 +1480,7 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                         "ok": False,
                         "code": "STALE_RESULT",
                         "error": (
-                            "Armature changed while Start was running; "
-                            "result discarded"
+                            "开始会话期间骨架发生变化，结果已丢弃"
                         ),
                     }
                 try:
@@ -1317,7 +1491,7 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
 
             submit_async(
                 context,
-                label="Start",
+                label="开始会话",
                 work=lambda: core.execute_start_request(prepared),
                 apply=apply_start,
                 success=start_succeeded,
@@ -1325,22 +1499,22 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Start failed: {exc}")
+            set_status(context, f"开始失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_finish(bpy.types.Operator):
     bl_idname = "skintokens_interactive.finish"
-    bl_label = "Finish"
-    bl_description = "End the interactive session and keep the generated asset"
+    bl_label = "结束"
+    bl_description = "结束交互会话并保留生成结果"
 
     def execute(self, context):
         if async_busy():
-            set_status(context, f"{_ASYNC_JOB['label']} is still running")
+            set_status(context, f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             return {"CANCELLED"}
         session_id = context.scene.skintokens_blender_session_id
         if not session_id:
-            set_status(context, "No interactive session to finish")
+            set_status(context, "当前没有可结束的会话")
             return {"CANCELLED"}
 
         cancel_history_sync()
@@ -1354,11 +1528,11 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
             if configured_output:
                 destination = Path(configured_output).expanduser().resolve()
                 if session is None:
-                    save_error = "interactive session is unavailable"
+                    save_error = "交互会话不可用"
                 else:
                     export_response = _CORE.export_skin(session_id, destination)
                     if not export_response.get("ok"):
-                        save_error = export_response.get("error", "TXT export failed")
+                        save_error = export_response.get("error", "TXT 导出失败")
                     else:
                         saved_path = Path(export_response["output_path"])
         except Exception as exc:
@@ -1389,24 +1563,24 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
 
         errors = []
         if save_error:
-            errors.append(f"TXT save failed: {save_error}")
+            errors.append(f"TXT 保存失败：{save_error}")
         if reset_error:
-            errors.append(f"server cleanup failed: {reset_error}")
+            errors.append(f"服务端清理失败：{reset_error}")
         if errors:
-            message = f"Finished locally; {'; '.join(errors)}"
+            message = f"本地会话已结束；{'；'.join(errors)}"
             set_status(context, message)
             self.report({"WARNING"}, message)
         elif saved_path is not None:
-            set_status(context, f"Finished and saved TXT: {saved_path}")
+            set_status(context, f"会话已结束，TXT 已保存到：{saved_path}")
         else:
-            set_status(context, "Finished interactive session; asset kept")
+            set_status(context, "会话已结束，模型和蒙皮结果已保留")
         return {"FINISHED"}
 
 
 class SKINTOKENS_OT_next(bpy.types.Operator):
     bl_idname = "skintokens_interactive.next"
-    bl_label = "Next"
-    bl_description = "Generate the next natural DFS unit, branch, or skeleton EOS"
+    bl_label = "衍生骨骼"
+    bl_description = "按模型预测继续生成下一段、其他分支或结束骨架"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1415,14 +1589,14 @@ class SKINTOKENS_OT_next(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Next failed: {exc}")
+            set_status(context, f"衍生骨骼失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_force_next(bpy.types.Operator):
     bl_idname = "skintokens_interactive.force_next"
-    bl_label = "Force Next"
-    bl_description = "Generate one child using the active Armature bone as parent"
+    bl_label = "强制衍生子骨骼"
+    bl_description = "以当前选中的骨骼为父级生成一根子骨骼"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1431,42 +1605,42 @@ class SKINTOKENS_OT_force_next(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Force Next failed: {exc}")
+            set_status(context, f"强制衍生子骨骼失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_import_txt(bpy.types.Operator):
     bl_idname = "skintokens_interactive.import_txt"
-    bl_label = "Import TXT"
-    bl_description = "Import heter-skinning txt skeleton and skin into the current session"
+    bl_label = "导入 TXT"
+    bl_description = "将 TXT 骨架和蒙皮导入当前会话"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             session_id = context.scene.skintokens_blender_session_id
             if not session_id:
-                raise RuntimeError("Start a session first")
+                raise RuntimeError("请先开始会话")
             if not context.scene.skintokens_import_txt_path.strip():
-                raise RuntimeError("Choose a heter-skinning txt first")
+                raise RuntimeError("请先选择 TXT 文件")
             txt_path = Path(context.scene.skintokens_import_txt_path).expanduser()
             response = get_core(context).import_txt(session_id, txt_path)
             if not response.get("ok"):
-                raise RuntimeError(response.get("error", "import txt failed"))
+                raise RuntimeError(response.get("error", "导入 TXT 失败"))
             count = len(response.get("context", {}).get("joints", []))
-            set_status(context, f"Imported TXT joints: {count}")
+            set_status(context, f"TXT 已导入：{count} 根骨骼")
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Import TXT failed: {exc}")
+            set_status(context, f"导入 TXT 失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_rig(bpy.types.Operator):
     bl_idname = "skintokens_interactive.rig"
-    bl_label = "Rig"
-    bl_description = "Continue the current rig until skeleton EOS"
+    bl_label = "生成骨骼树"
+    bl_description = "从当前骨架继续生成，直到骨架结束"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1475,14 +1649,14 @@ class SKINTOKENS_OT_rig(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Rig failed: {exc}")
+            set_status(context, f"生成骨骼树失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_skin(bpy.types.Operator):
     bl_idname = "skintokens_interactive.skin"
-    bl_label = "Skin"
-    bl_description = "Generate skin for the current interactive skeleton"
+    bl_label = "生成蒙皮"
+    bl_description = "为当前骨架生成蒙皮权重"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1491,119 +1665,119 @@ class SKINTOKENS_OT_skin(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Skin failed: {exc}")
+            set_status(context, f"生成蒙皮失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_refresh(bpy.types.Operator):
     bl_idname = "skintokens_interactive.refresh"
-    bl_label = "Refresh"
-    bl_description = "Sync edited or deleted Armature bones without generating"
+    bl_label = "刷新"
+    bl_description = "同步编辑或删除后的骨架，不执行生成"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             session_id = context.scene.skintokens_blender_session_id
             if not session_id:
-                raise RuntimeError("Start a session first")
+                raise RuntimeError("请先开始会话")
             core = get_core(context)
             prepared = core.prepare_refresh(session_id)
             _schedule_context_edit(
                 context,
-                label="Refresh",
+                label="刷新骨架",
                 prepared=prepared,
                 apply_result=core.apply_refresh_request,
                 success=lambda result_context, response: set_status(
                     result_context,
-                    f"Refreshed joints: {len(response.get('context', {}).get('joints', []))}",
+                    f"骨架已刷新：{len(response.get('context', {}).get('joints', []))} 根骨骼",
                 ),
             )
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Refresh failed: {exc}")
+            set_status(context, f"刷新失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_vae_apply(bpy.types.Operator):
     bl_idname = "skintokens_interactive.vae_apply"
-    bl_label = "Apply VAE Level"
-    bl_description = "Commit the current VAE preview as the new editable level 0"
+    bl_label = "应用权重场递归重建"
+    bl_description = "将当前权重场递归重建预览应用为新的可编辑 0 级"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             session_id = context.scene.skintokens_blender_session_id
             if not session_id:
-                raise RuntimeError("Start a session first")
+                raise RuntimeError("请先开始会话")
             response = get_core(context).apply_vae_reconstruction_levels(session_id)
             if not response.get("ok"):
-                raise RuntimeError(response.get("error", "VAE apply failed"))
+                raise RuntimeError(response.get("error", "应用权重场递归重建失败"))
             applied = response.get("applied_levels", {})
             detail = ", ".join(
                 f"{name}:{level}" for name, level in applied.items()
             )
             set_status(
                 context,
-                f"Applied VAE preview ({detail}); levels reset to 0",
+                f"权重场递归重建预览已应用（{detail}），级别已重置为 0",
             )
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"VAE apply failed: {exc}")
+            set_status(context, f"应用权重场递归重建失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_split(bpy.types.Operator):
     bl_idname = "skintokens_interactive.split"
-    bl_label = "Split"
-    bl_description = "Insert a midpoint joint into the selected bone"
+    bl_label = "拆分骨骼"
+    bl_description = "在选中骨骼中插入一个中点骨骼"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             session_id = context.scene.skintokens_blender_session_id
             if not session_id:
-                raise RuntimeError("Start a session first")
+                raise RuntimeError("请先开始会话")
             core = get_core(context)
             prepared = core.prepare_split(session_id)
             _schedule_context_edit(
                 context,
-                label="Split",
+                label="拆分骨骼",
                 prepared=prepared,
                 apply_result=core.apply_split_request,
                 success=lambda result_context, response: set_status(
                     result_context,
-                    "Split bone. Joints: "
-                    f"{len(response.get('context', {}).get('joints', []))}",
+                    "骨骼已拆分：共 "
+                    f"{len(response.get('context', {}).get('joints', []))} 根骨骼",
                 ),
             )
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Split failed: {exc}")
+            set_status(context, f"拆分失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_delete(bpy.types.Operator):
     bl_idname = "skintokens_interactive.delete"
-    bl_label = "Collapse"
-    bl_description = "Collapse the active bone's child segment or remove an active leaf"
+    bl_label = "收合子骨骼"
+    bl_description = "收合当前骨骼的下一段，或移除末端骨骼"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         try:
             if async_busy():
-                raise RuntimeError(f"{_ASYNC_JOB['label']} is still running")
+                raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             session_id = context.scene.skintokens_blender_session_id
             if not session_id:
-                raise RuntimeError("Start a session first")
+                raise RuntimeError("请先开始会话")
             core = get_core(context)
             prepared = core.prepare_delete(session_id)
 
@@ -1611,12 +1785,12 @@ class SKINTOKENS_OT_delete(bpy.types.Operator):
                 count = len(response.get("context", {}).get("joints", []))
                 set_status(
                     result_context,
-                    f"Collapsed {response.get('deleted_bone_name')}. Joints: {count}",
+                    f"已收合 {response.get('deleted_bone_name')}：共 {count} 根骨骼",
                 )
 
             _schedule_context_edit(
                 context,
-                label="Collapse",
+                label="收合子骨骼",
                 prepared=prepared,
                 apply_result=core.apply_delete_request,
                 success=succeeded,
@@ -1624,29 +1798,30 @@ class SKINTOKENS_OT_delete(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
-            set_status(context, f"Collapse failed: {exc}")
+            set_status(context, f"收合失败：{exc}")
             return {"CANCELLED"}
 
 
 class SKINTOKENS_PT_interactive(bpy.types.Panel):
-    bl_label = "SkinTokens Interactive"
+    bl_label = "H3D Skintokens"
     bl_idname = "SKINTOKENS_PT_interactive"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "SkinTokens"
+    bl_category = "H3D Skintokens"
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        url_row = layout.row()
-        url_row.enabled = not async_busy() and not has_session_marker(context)
+        url_row = layout.row(align=True)
+        url_value = url_row.row(align=True)
+        url_value.enabled = False
         preferences = get_addon_preferences(context)
         if preferences is None:
-            url_row.prop(scene, "skintokens_model_socket")
+            url_value.prop(scene, "skintokens_model_socket")
         else:
-            url_row.prop(preferences, "server_url", text="Server URL")
+            url_value.prop(preferences, "server_url", text="服务器地址")
         connection_button = url_row.row(align=True)
-        connection_button.enabled = online_access_enabled()
+        connection_button.enabled = online_access_enabled() and not async_busy()
         connection_button.operator(
             "skintokens_interactive.test_connection",
             text="",
@@ -1657,11 +1832,11 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
             access_box.alert = True
             if online_access_forced_off():
                 access_box.label(
-                    text="Restart Blender without --offline-mode",
+                    text="请关闭离线模式并重启 Blender",
                     icon="ERROR",
                 )
             else:
-                access_box.label(text="SkinTokens requires network access", icon="INFO")
+                access_box.label(text="SkinTokens 需要联网权限", icon="INFO")
                 access_box.operator(
                     "skintokens_interactive.enable_online_access",
                     icon="CHECKMARK",
@@ -1684,7 +1859,7 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
         slider_row.prop(
             scene,
             "skintokens_vae_reconstruction_level",
-            text="VAE Level",
+            text="权重场递归重建",
             slider=True,
         )
         apply_row = vae_row.row(align=True)
@@ -1711,7 +1886,7 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
             else:
                 props = state_row.operator(
                     "extensions.package_install",
-                    text=f"Update to {update['version']}",
+                    text=f"更新到 {update['version']}",
                     icon="FILE_REFRESH",
                 )
                 props.repo_index = update["repo_index"]
@@ -1745,39 +1920,39 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.skintokens_model_socket = bpy.props.StringProperty(
-        name="Server URL",
+        name="服务器地址",
         default=DEFAULT_MODEL_URL,
     )
     bpy.types.Scene.skintokens_owner_id = bpy.props.StringProperty(default="", options={"HIDDEN"})
     bpy.types.Scene.skintokens_output_path = bpy.props.StringProperty(
-        name="Output",
+        name="输出路径",
         default="",
         subtype="FILE_PATH",
     )
     bpy.types.Scene.skintokens_import_txt_path = bpy.props.StringProperty(
-        name="Import TXT",
+        name="导入 TXT",
         default="",
         subtype="FILE_PATH",
     )
     bpy.types.Scene.skintokens_blender_session_id = bpy.props.StringProperty(default="")
-    bpy.types.Scene.skintokens_status = bpy.props.StringProperty(default="Idle")
+    bpy.types.Scene.skintokens_status = bpy.props.StringProperty(default="未开始")
     bpy.types.Scene.skintokens_vae_reconstruction_level = bpy.props.IntProperty(
-        name="VAE Level",
+        name="权重场递归重建",
         description=(
-            "Choose cached VAE reconstruction level 0-3 for the active skin bone"
+            "为当前蒙皮骨骼选择缓存的 VAE 重建级别 0-3"
         ),
         min=0,
         max=DEFAULT_VAE_RECONSTRUCTION_MAX_LEVEL,
         get=get_vae_reconstruction_level,
         set=set_vae_reconstruction_level,
     )
-    bpy.types.Scene.skintokens_max_new_tokens = bpy.props.IntProperty(name="Next Tokens", default=16, min=1, max=64)
-    bpy.types.Scene.skintokens_skin_max_new_tokens = bpy.props.IntProperty(name="Skin Tokens", default=2048, min=8, max=8192)
+    bpy.types.Scene.skintokens_max_new_tokens = bpy.props.IntProperty(name="下一步 Token 数", default=16, min=1, max=64)
+    bpy.types.Scene.skintokens_skin_max_new_tokens = bpy.props.IntProperty(name="蒙皮 Token 数", default=2048, min=8, max=8192)
     bpy.types.Scene.skintokens_top_k = bpy.props.IntProperty(name="Top K", default=5, min=0, max=100)
     bpy.types.Scene.skintokens_top_p = bpy.props.FloatProperty(name="Top P", default=0.95, min=0.0, max=1.0)
-    bpy.types.Scene.skintokens_temperature = bpy.props.FloatProperty(name="Temperature", default=1.5, min=0.01, max=5.0)
-    bpy.types.Scene.skintokens_repetition_penalty = bpy.props.FloatProperty(name="Repetition Penalty", default=1.2, min=0.1, max=5.0)
-    bpy.types.Scene.skintokens_num_beams = bpy.props.IntProperty(name="Beams", default=1, min=1, max=16)
+    bpy.types.Scene.skintokens_temperature = bpy.props.FloatProperty(name="温度", default=1.5, min=0.01, max=5.0)
+    bpy.types.Scene.skintokens_repetition_penalty = bpy.props.FloatProperty(name="重复惩罚", default=1.2, min=0.1, max=5.0)
+    bpy.types.Scene.skintokens_num_beams = bpy.props.IntProperty(name="束搜索数", default=1, min=1, max=16)
     if sync_model_after_history_change not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(sync_model_after_history_change)
     if sync_model_after_history_change not in bpy.app.handlers.redo_post:
@@ -1787,6 +1962,7 @@ def register():
             sync_model_after_armature_change
         )
     _schedule_extension_repository_sync()
+    _schedule_extension_event_report()
 
 
 def unregister():
@@ -1804,6 +1980,7 @@ def unregister():
     cancel_armature_watch()
     cancel_async_job()
     _cancel_extension_repository_sync()
+    _cancel_extension_event_report()
     core = _CORE
     _CORE = None
     if core is not None:

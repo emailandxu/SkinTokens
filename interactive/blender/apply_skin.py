@@ -11,6 +11,7 @@ JOINT_ID_PROP = "skintokens_joint_id"
 PARENT_ID_PROP = "skintokens_parent_id"
 DFS_ORDER_PROP = "skintokens_dfs_order"
 MANAGED_BONE_PROP = "skintokens_managed_bone"
+CREATED_SESSION_PROP = "skintokens_created_session"
 
 
 def _bpy():
@@ -172,6 +173,41 @@ def _set_pose_bone_selected(armature_obj, bone_name: str, selected: bool) -> Non
         pose_bone.select = bool(selected)
 
 
+def _bone_point(bone, attribute: str) -> tuple[float, float, float]:
+    value = getattr(bone, attribute)
+    return (float(value.x), float(value.y), float(value.z))
+
+
+def capture_armature_bone_states(
+    armature_obj,
+) -> dict[str, tuple[str, str, tuple[float, float, float], tuple[float, float, float]]]:
+    """Capture edit-relevant state keyed by a persistent joint id."""
+    if armature_obj is None or armature_obj.type != "ARMATURE":
+        raise ValueError("mesh has no armature")
+    edit_mode = armature_obj.mode == "EDIT"
+    source_bones = (
+        list(armature_obj.data.edit_bones)
+        if edit_mode
+        else list(armature_obj.data.bones)
+    )
+    result = {}
+    for bone in source_bones:
+        joint_id = str(bone.get(JOINT_ID_PROP, "")) or uuid.uuid4().hex
+        bone[JOINT_ID_PROP] = joint_id
+        parent = bone.parent
+        parent_id = ""
+        if parent is not None:
+            parent_id = str(parent.get(JOINT_ID_PROP, "")) or uuid.uuid4().hex
+            parent[JOINT_ID_PROP] = parent_id
+        result[joint_id] = (
+            str(bone.name),
+            parent_id,
+            _bone_point(bone, "head" if edit_mode else "head_local"),
+            _bone_point(bone, "tail" if edit_mode else "tail_local"),
+        )
+    return result
+
+
 def parse_armature_object(armature_obj) -> tuple[list[list[float]], list[int], list[str]]:
     if armature_obj is None or armature_obj.type != "ARMATURE":
         raise ValueError("mesh has no armature")
@@ -325,6 +361,11 @@ def apply_armature_context(
     select_name: str | None = None,
     remove_missing: bool = False,
     mode_after: str | None = None,
+    session_id: str | None = None,
+    original_bone_ids: set[str] | None = None,
+    tail_follow_bone_ids: set[str] | None = None,
+    allow_remove_names: set[str] | None = None,
+    allow_reparent_names: set[str] | None = None,
 ) -> None:
     bpy = _bpy()
     mathutils = _mathutils()
@@ -357,11 +398,23 @@ def apply_armature_context(
     if final_mode not in {"OBJECT", "EDIT", "POSE"}:
         final_mode = "OBJECT"
 
-    managed_before = {
-        bone.name
-        for bone in armature_obj.data.bones
-        if bool(bone.get(MANAGED_BONE_PROP, False))
-    }
+    original_bone_ids = set(original_bone_ids or ())
+    if tail_follow_bone_ids is None:
+        tail_follow_bone_ids = set()
+    allow_remove_names = set(allow_remove_names or ())
+    allow_reparent_names = set(allow_reparent_names or ())
+    if session_id is None:
+        managed_before = {
+            bone.name
+            for bone in armature_obj.data.bones
+            if bool(bone.get(MANAGED_BONE_PROP, False))
+        }
+    else:
+        managed_before = {
+            str(bone.name)
+            for bone in armature_obj.data.bones
+            if str(bone.get(JOINT_ID_PROP, "")) not in original_bone_ids
+        }
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     bpy.ops.object.select_all(action="DESELECT")
@@ -370,10 +423,39 @@ def apply_armature_context(
     bpy.ops.object.mode_set(mode="EDIT")
 
     edit_bones = armature_obj.data.edit_bones
+    existing_names = {str(bone.name) for bone in edit_bones}
+    children_before = {
+        str(bone.name): {str(child.name) for child in bone.children}
+        for bone in edit_bones
+    }
+    original_names_before = {
+        str(bone.name)
+        for bone in edit_bones
+        if str(bone.get(JOINT_ID_PROP, "")) in original_bone_ids
+    }
+    if session_id is None:
+        non_model_managed_names = existing_names - managed_before
+    else:
+        non_model_managed_names = {
+            str(bone.name)
+            for bone in edit_bones
+            if str(bone.get(JOINT_ID_PROP, "")) in original_bone_ids
+        }
     if remove_missing:
         keep = set(names)
+        blocked = sorted(
+            non_model_managed_names - keep - allow_remove_names
+        )
+        if blocked:
+            raise ValueError(
+                "服务端结果不能删除会话开始前已有的骨骼："
+                + ", ".join(blocked)
+            )
         for bone in list(edit_bones):
             if bone.name not in keep:
+                # Disconnect before removal so Blender does not move the
+                # surviving parent's Tail as a side effect.
+                bone.use_connect = False
                 edit_bones.remove(bone)
 
     world_to_armature = armature_obj.matrix_world.inverted()
@@ -385,15 +467,16 @@ def apply_armature_context(
             if bone.name != name:
                 raise ValueError(f"generated bone name is not unique: {name}")
             created_names.add(name)
+            bone[JOINT_ID_PROP] = uuid.uuid4().hex
+            if session_id is not None:
+                bone[CREATED_SESSION_PROP] = session_id
         if name in created_names or name in managed_before:
+            # A connected child moves its parent's Tail when its Head changes.
+            bone.use_connect = False
             head = world_to_armature @ mathutils.Vector(
                 tuple(float(value) for value in joint)
             )
-            tail = world_to_armature @ mathutils.Vector(
-                tuple(float(value) for value in _tail_for_joint(joints, parents, index))
-            )
             bone.head = head
-            bone.tail = tail
             if (bone.tail - bone.head).length_squared < 1e-10:
                 bone.tail = bone.head + mathutils.Vector((0.0, 0.0, 0.1))
 
@@ -404,12 +487,73 @@ def apply_armature_context(
         current_parent_name = None if bone.parent is None else str(bone.parent.name)
         new_parent_name = None if new_parent is None else str(new_parent.name)
         parent_changed = current_parent_name != new_parent_name
-        bone.parent = new_parent
-        if name in created_names or name in managed_before or parent_changed:
-            bone.use_connect = False
+        can_reparent = (
+            name in created_names
+            or name in managed_before
+            or name in allow_reparent_names
+        )
+        if parent_changed and not can_reparent:
+            raise ValueError(
+                f"服务端结果不能修改会话开始前已有的骨骼层级：{name}"
+            )
+        if can_reparent:
+            if parent_changed:
+                # A connected endpoint can move while its parent is replaced.
+                bone.use_connect = False
+            bone.parent = new_parent
         bone.select = False
         bone.select_head = False
         bone.select_tail = False
+
+    children_by_parent = [[] for _ in names]
+    for child_index, parent_index in enumerate(parents):
+        parent_index = int(parent_index)
+        if parent_index >= 0:
+            children_by_parent[parent_index].append(child_index)
+
+    # Session-created bones remain model-managed. An original leaf starts
+    # following its first session child and keeps following that child's Head
+    # for the rest of the session. Removing the child leaves the last Tail in
+    # place rather than restoring a pre-session value.
+    for index, name in enumerate(names):
+        bone = edit_bones[name]
+        bone_id = str(bone.get(JOINT_ID_PROP, ""))
+        children = children_by_parent[index]
+        child_names = {names[child_index] for child_index in children}
+        was_original_leaf = (
+            name in original_names_before and not children_before.get(name)
+        )
+        gained_first_child = bool(
+            was_original_leaf
+            and child_names.difference(children_before.get(name, set()))
+        )
+        if gained_first_child and bone_id:
+            tail_follow_bone_ids.add(bone_id)
+        follows_session_child = bool(
+            children and bone_id in tail_follow_bone_ids
+        )
+        if (
+            name not in created_names
+            and name not in managed_before
+            and not follows_session_child
+        ):
+            continue
+        if children:
+            tail = edit_bones[names[children[0]]].head.copy()
+        else:
+            parent_index = int(parents[index])
+            if parent_index >= 0:
+                parent_head = edit_bones[names[parent_index]].head
+                direction = bone.head - parent_head
+                if direction.length_squared > 1e-10:
+                    tail = bone.head + direction * 0.35
+                else:
+                    tail = bone.head + mathutils.Vector((0.0, 0.0, 0.1))
+            else:
+                tail = bone.head + mathutils.Vector((0.0, 0.0, 0.1))
+        bone.tail = tail
+        if (bone.tail - bone.head).length_squared < 1e-10:
+            bone.tail = bone.head + mathutils.Vector((0.0, 0.0, 0.1))
     if selected_name is not None and edit_bones.get(selected_name) is not None:
         selected = edit_bones[selected_name]
         selected.select = True
@@ -436,6 +580,8 @@ def apply_armature_context(
         bone[DFS_ORDER_PROP] = index
         if name in created_names:
             bone[MANAGED_BONE_PROP] = True
+            if session_id is not None:
+                bone[CREATED_SESSION_PROP] = session_id
         _set_pose_bone_selected(armature_obj, name, name == selected_name)
     if (
         selected_name is not None

@@ -15,7 +15,8 @@ import numpy as np
 
 DEFAULT_MODEL_URL = "http://172.17.60.251:8765"
 PROTOCOL_VERSION = 1
-EXTENSION_VERSION = "1.8.6"
+EXTENSION_PACKAGE_ID = "h3d_skintokens"
+EXTENSION_VERSION = "1.0.0"
 
 Request = Dict[str, Any]
 Response = Dict[str, Any]
@@ -89,6 +90,14 @@ def request(
                 ),
             }
         )
+    elif command == "extension_event":
+        url = f"{base_url}/v1/extensions/events"
+        body = json.dumps({
+            key: value
+            for key, value in payload.items()
+            if key not in {"command", "owner_id"}
+        }).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     else:
         session_id = quote(str(payload.get("session_id", "")), safe="")
         if command == "ping":

@@ -1,4 +1,4 @@
-"""SkinTokens Interactive Blender extension."""
+"""H3D Skintokens Blender extension."""
 
 
 def register() -> None:

@@ -12,7 +12,7 @@ def print_response(response: dict) -> None:
 
 
 def model_smoke(args: argparse.Namespace) -> None:
-    start = request(args.socket, {"command": "start", "obj_path": args.obj})
+    start = request(args.endpoint, {"command": "start", "obj_path": args.obj})
     print_response(start)
     if not start.get("ok"):
         return
@@ -20,7 +20,7 @@ def model_smoke(args: argparse.Namespace) -> None:
     context = start.get("context", {})
     for _ in range(args.steps):
         response = request(
-            args.socket,
+            args.endpoint,
             {
                 "command": "next",
                 "session_id": session_id,
@@ -36,7 +36,7 @@ def model_smoke(args: argparse.Namespace) -> None:
             break
     if args.skin:
         response = request(
-            args.socket,
+            args.endpoint,
             {
                 "command": "skin",
                 "session_id": session_id,
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="target", required=True)
 
     model = sub.add_parser("model", help="Talk directly to the interactive model server.")
-    model.add_argument("--endpoint", "--socket", dest="socket", default=DEFAULT_MODEL_URL)
+    model.add_argument("--endpoint", default=DEFAULT_MODEL_URL)
     model.add_argument("--obj", default="examples/xiaobaozi.obj")
     model.add_argument("--steps", type=int, default=2)
     model.add_argument("--max-new-tokens", type=int, default=16)

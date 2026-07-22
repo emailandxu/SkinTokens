@@ -29,10 +29,11 @@ from interactive.blender.core import (
     same_skeleton_context,
 )
 from interactive.blender.preview import _context_without_deleted_joints, preview_style
-from interactive.http_server import InteractiveHttpApi, ThreadingWSGIServer
+from interactive.server import InteractiveHttpApi, ThreadingWSGIServer
 from interactive.protocol import decode_float32_array, encode_float32_array, request
 from interactive.server import InteractiveModelServer, InteractiveServiceError
 from interactive.session import InteractiveSession, SessionRecord, SkeletonContext
+from interactive.usage_events import UsageEventLog, load_usage_events
 from interactive.skeleton_stream import (
     GenerationOptions,
     generate_rig,
@@ -128,8 +129,9 @@ class InteractiveHttpTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.service = FakeModelService()
+        self.service.usage_events = UsageEventLog(root / "usage")
         self.extension_archive = b"blender-extension-archive"
-        self.extension_archive_name = "skintokens_interactive-1.8.2.zip"
+        self.extension_archive_name = "h3d_skintokens-1.0.0.zip"
         self.extension_repo = root / "blender_extensions"
         self.extension_repo.mkdir()
         (self.extension_repo / self.extension_archive_name).write_bytes(
@@ -141,9 +143,9 @@ class InteractiveHttpTest(unittest.TestCase):
                 "blocklist": [],
                 "data": [{
                     "schema_version": "1.0.0",
-                    "id": "skintokens_interactive",
-                    "name": "SkinTokens Interactive",
-                    "version": "1.8.2",
+                    "id": "h3d_skintokens",
+                    "name": "H3D Skintokens",
+                    "version": "1.0.0",
                     "type": "add-on",
                     "archive_url": f"./{self.extension_archive_name}",
                     "archive_size": len(self.extension_archive),
@@ -274,7 +276,7 @@ class InteractiveHttpTest(unittest.TestCase):
         with urlopen(f"{self.endpoint}/blender/extensions/index.json") as result:
             index = json.loads(result.read().decode("utf-8"))
             self.assertEqual(result.headers["Cache-Control"], "no-cache")
-        self.assertEqual(index["data"][0]["version"], "1.8.2")
+        self.assertEqual(index["data"][0]["version"], "1.0.0")
 
         with urlopen(
             f"{self.endpoint}/blender/extensions/{self.extension_archive_name}"
@@ -287,7 +289,8 @@ class InteractiveHttpTest(unittest.TestCase):
         health = request(self.endpoint, {"command": "ping"})
         repository = health["blender_extensions"]
         self.assertTrue(repository["ready"])
-        self.assertEqual(repository["latest_version"], "1.8.2")
+        self.assertEqual(repository["package_id"], "h3d_skintokens")
+        self.assertEqual(repository["latest_version"], "1.0.0")
         self.assertEqual(repository["repository_path"], "/blender/extensions/")
 
     def test_blender_extension_repository_rejects_unpublished_files(self) -> None:
@@ -308,8 +311,37 @@ class InteractiveHttpTest(unittest.TestCase):
         self.assertTrue(started["ok"])
         self.assertEqual(
             self.service.calls[0]["blender_extension_version"],
-            "1.8.6",
+            "1.0.0",
         )
+
+    def test_extension_install_and_update_events_are_logged(self) -> None:
+        for action, previous_version, version in (
+            ("install", "", "1.0.0"),
+            ("update", "1.0.0", "1.0.1"),
+        ):
+            result = blender_request(
+                self.endpoint,
+                {
+                    "command": "extension_event",
+                    "owner_id": "installation-a",
+                    "action": action,
+                    "package_id": "h3d_skintokens",
+                    "extension_version": version,
+                    "previous_version": previous_version,
+                    "blender_version": "5.2.0",
+                    "installation_id": "installation-a",
+                    "installation_source": "repository",
+                },
+            )
+            self.assertTrue(result["ok"])
+
+        events = load_usage_events(self.service.usage_events.root)
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["extension_install", "extension_update"],
+        )
+        self.assertEqual(events[0]["client_ip"], "127.0.0.1")
+        self.assertEqual(events[1]["previous_version"], "1.0.0")
 
     def test_infer_cli_uses_running_http_service(self) -> None:
         output_path = Path(self.temporary.name) / "infer" / "skin.txt"
@@ -772,6 +804,74 @@ class InteractiveEnsembleTest(unittest.TestCase):
         self.assertEqual(response["skin_ensemble"]["selected_candidate"], "baseline")
         self.assertTrue(response["context"]["done"])
 
+    def test_skin_response_limits_weights_to_top_four_by_default(self) -> None:
+        bone_count = 6
+        affine = np.eye(4, dtype=np.float64)[:, :3]
+        context = SkeletonContext(
+            joints=np.zeros((bone_count, 3), dtype=np.float32),
+            parents=np.asarray([-1, 0, 1, 2, 3, 4], dtype=np.int32),
+            joint_names=[f"bone_{index}" for index in range(bone_count)],
+        )
+        session = InteractiveSession(
+            session_id="session",
+            obj_path=Path("mesh.obj"),
+            device="cpu",
+            cls="articulation",
+            vertices=torch.asarray(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            ),
+            normals=torch.asarray(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]
+            ),
+            faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+            learned_mesh_cond=None,
+            cond_latents=None,
+            normalized_vertices_cpu=np.asarray(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float32,
+            ),
+            blender_vertices=np.zeros((3, 3), dtype=np.float32),
+            obj_text_vertices=np.zeros((3, 3), dtype=np.float32),
+            normalized_to_blender=affine,
+            blender_to_normalized=affine,
+            normalized_to_obj_text=affine,
+            blender_to_obj_text=affine,
+            context=context,
+        )
+        dense_skin = np.asarray(
+            [
+                [0.30, 0.25, 0.20, 0.10, 0.08, 0.07],
+                [0.05, 0.06, 0.07, 0.08, 0.34, 0.40],
+                [0.10, 0.15, 0.25, 0.20, 0.18, 0.12],
+            ],
+            dtype=np.float32,
+        )
+        ensemble = SimpleNamespace(
+            selected=SimpleNamespace(
+                sampled_skin=dense_skin,
+                order=tuple(range(bone_count)),
+            ),
+            report=Mock(return_value={}),
+        )
+        service = InteractiveModelServer.__new__(InteractiveModelServer)
+        service.model = object()
+        service.device = "cpu"
+        service._session = Mock(return_value=session)
+        service._context = Mock(return_value=context)
+
+        with patch(
+            "interactive.server.generate_skin_ensemble",
+            return_value=ensemble,
+        ):
+            response = service.skin({"session_id": "session"})
+
+        returned = decode_float32_array(
+            response["skin"],
+            tuple(response["asset_skin_shape"]),
+        )
+        self.assertLessEqual(int((returned > 1e-8).sum(axis=1).max()), 4)
+        np.testing.assert_allclose(returned.sum(axis=1), 1.0, atol=1e-6)
+
 
 class BlenderRecoveryTest(unittest.TestCase):
     def test_server_status_rejects_incompatible_protocol(self) -> None:
@@ -834,6 +934,10 @@ class BlenderRecoveryTest(unittest.TestCase):
                     context["parents"],
                     context["joint_names"],
                 ),
+            ),
+            patch(
+                "interactive.blender.core.capture_armature_bone_states",
+                return_value={},
             ),
         ):
             response = core.sync_history_snapshot(session.blender_session_id)
@@ -1200,6 +1304,7 @@ class BlenderRecoveryTest(unittest.TestCase):
             select_name="root",
             remove_missing=True,
             mode_after="EDIT",
+            allow_reparent_names={"child"},
         )
 
     def test_split_reparents_all_direct_children_to_midpoint(self) -> None:
@@ -1297,6 +1402,8 @@ class BlenderRecoveryTest(unittest.TestCase):
             select_name="root",
             remove_missing=True,
             mode_after="EDIT",
+            allow_remove_names={"branch"},
+            allow_reparent_names={"leaf"},
         )
 
     def test_delete_removes_the_active_leaf_itself(self) -> None:
@@ -1341,6 +1448,8 @@ class BlenderRecoveryTest(unittest.TestCase):
             select_name="root",
             remove_missing=True,
             mode_after="EDIT",
+            allow_remove_names={"leaf"},
+            allow_reparent_names=set(),
         )
 
     def test_start_automatically_uses_scene_armature_as_context(self) -> None:
@@ -1385,6 +1494,10 @@ class BlenderRecoveryTest(unittest.TestCase):
                     return_value=armature_obj,
                 ) as ensured,
                 patch.object(core, "_apply_context_to_armature") as applied,
+                patch(
+                    "interactive.blender.core.capture_armature_bone_states",
+                    return_value={},
+                ),
                 patch(
                     "interactive.blender.core.active_armature_bone_name",
                     return_value=None,
@@ -1445,6 +1558,10 @@ class BlenderRecoveryTest(unittest.TestCase):
                     return_value=armature_obj,
                 ) as ensured,
                 patch.object(core, "_apply_context_to_armature") as applied,
+                patch(
+                    "interactive.blender.core.capture_armature_bone_states",
+                    return_value={},
+                ),
             ):
                 result = core.start(
                     obj_path,

@@ -10,6 +10,7 @@ from typing import Any
 
 
 USAGE_SCHEMA_VERSION = 1
+USAGE_LOG_FILENAME = "events.jsonl"
 
 
 class UsageEventLog:
@@ -29,7 +30,7 @@ class UsageEventLog:
         data = (
             json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        path = self.root / f"{now.date().isoformat()}.jsonl"
+        path = self.root / USAGE_LOG_FILENAME
         try:
             with self._lock:
                 self.root.mkdir(parents=True, exist_ok=True)
@@ -39,7 +40,12 @@ class UsageEventLog:
                     0o644,
                 )
                 try:
-                    os.write(descriptor, data)
+                    remaining = memoryview(data)
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written <= 0:
+                            raise OSError("usage event write made no progress")
+                        remaining = remaining[written:]
                 finally:
                     os.close(descriptor)
             return path
@@ -55,11 +61,6 @@ def load_usage_events(
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for path in sorted(Path(root).expanduser().resolve().glob("*.jsonl")):
-        day = path.stem
-        if date_from is not None and day < date_from:
-            continue
-        if date_to is not None and day > date_to:
-            continue
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -68,5 +69,10 @@ def load_usage_events(
             except json.JSONDecodeError:
                 continue
             if isinstance(event, dict):
+                day = str(event.get("time_utc", ""))[:10]
+                if date_from is not None and day < date_from:
+                    continue
+                if date_to is not None and day > date_to:
+                    continue
                 events.append(event)
     return events

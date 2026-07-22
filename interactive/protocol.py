@@ -3,8 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from dataclasses import dataclass
-from multiprocessing.connection import Client
 from pathlib import Path
 from typing import Any, Dict
 from urllib.error import HTTPError
@@ -17,9 +15,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = REPO_ROOT / ".runtime"
-MODEL_SOCKET_PATH = RUNTIME_DIR / "interactive_model.sock"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8765"
-AUTHKEY = b"skintokens-interactive"
 
 
 Request = Dict[str, Any]
@@ -63,12 +59,6 @@ def decode_float32_array(payload: Any, expected_shape: tuple[int, ...]) -> np.nd
     ):
         raise ValueError("compressed float array has an invalid decoded size")
     return np.frombuffer(raw, dtype="<f4").reshape(expected_shape).copy()
-
-
-@dataclass(frozen=True)
-class SocketConfig:
-    path: Path = MODEL_SOCKET_PATH
-    authkey: bytes = AUTHKEY
 
 
 def ensure_runtime_dir() -> None:
@@ -149,12 +139,10 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
     return response_payload
 
 
-def request(socket_path: str | Path, payload: Request, authkey: bytes = AUTHKEY) -> Response:
-    if _is_http_endpoint(socket_path):
-        return _http_request(socket_path, payload)
-    with Client(str(socket_path), family="AF_UNIX", authkey=authkey) as conn:
-        conn.send(payload)
-        response = conn.recv()
+def request(endpoint: str | Path, payload: Request) -> Response:
+    if not _is_http_endpoint(endpoint):
+        raise ValueError("interactive endpoint must start with http:// or https://")
+    response = _http_request(endpoint, payload)
     if not isinstance(response, dict):
         raise RuntimeError(f"interactive server returned non-dict response: {type(response)}")
     return response

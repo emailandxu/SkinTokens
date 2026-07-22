@@ -83,6 +83,8 @@ class UsageEventLogTest(unittest.TestCase):
 
             loaded = load_usage_events(temporary)
             self.assertTrue(all(path is not None for path in paths))
+            self.assertEqual({path.name for path in paths}, {"events.jsonl"})
+            self.assertEqual(len(list(Path(temporary).glob("*.jsonl"))), 1)
             self.assertEqual(len(loaded), 200)
             self.assertEqual(len({event["event_id"] for event in loaded}), 200)
 
@@ -102,6 +104,23 @@ class UsageEventLogTest(unittest.TestCase):
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["sessions_started"], 1)
             self.assertEqual(report["sessions_incomplete"], 1)
+
+    def test_report_counts_extension_lifecycle_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            events = UsageEventLog(temporary)
+            events.append(
+                "extension_install",
+                installation_id="installation-a",
+            )
+            events.append(
+                "extension_update",
+                installation_id="installation-a",
+            )
+
+            report = build_usage_report(load_usage_events(temporary))
+            self.assertEqual(report["extension_installs"], 1)
+            self.assertEqual(report["extension_updates"], 1)
+            self.assertEqual(report["extension_installations"], 1)
 
 
 class UsageLifecycleTest(unittest.TestCase):

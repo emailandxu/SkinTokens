@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from interactive.http_server import build_parser
+from interactive.server import build_parser
 from interactive.server_config import load_server_config, parse_args_with_config
 
 

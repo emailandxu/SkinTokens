@@ -17,7 +17,9 @@ import bpy  # type: ignore  # noqa: E402
 
 from interactive.blender import addon  # noqa: E402
 from interactive.blender.apply_skin import (  # noqa: E402
+    JOINT_ID_PROP,
     apply_armature_context,
+    capture_armature_bone_states,
     ensure_mesh_armature,
     parse_armature_object,
 )
@@ -77,6 +79,14 @@ apply_armature_context(
 
 addon.register()
 scene = bpy.context.scene
+assert addon.SKINTOKENS_OT_next.bl_label == "衍生骨骼"
+assert addon.SKINTOKENS_OT_force_next.bl_label == "强制衍生子骨骼"
+assert addon.SKINTOKENS_OT_rig.bl_label == "生成骨骼树"
+assert addon.SKINTOKENS_OT_split.bl_label == "拆分骨骼"
+assert addon.SKINTOKENS_OT_delete.bl_label == "收合子骨骼"
+assert bpy.types.Scene.bl_rna.properties[
+    "skintokens_vae_reconstruction_level"
+].name == "权重场递归重建"
 assert bpy.types.Scene.bl_rna.properties[
     "skintokens_vae_reconstruction_level"
 ].hard_max == 3
@@ -88,6 +98,11 @@ core = BlenderInteractiveCore(
     scene.skintokens_model_socket,
     owner_id=scene.skintokens_owner_id,
 )
+# Keep deliberately authored pre-session Tails. Context application must not
+# rewrite the non-leaf Tail, and a leaf changes only when it gains a child.
+armature_object.data.edit_bones["root"].tail = (0.4, 0.6, 0.2)
+armature_object.data.edit_bones["sibling"].tail = (0.0, 1.0, 2.0)
+initial_bone_snapshot = capture_armature_bone_states(armature_object)
 session = BlenderInteractiveSession(
     blender_session_id="blender-session",
     model_session_id="model-session",
@@ -95,8 +110,80 @@ session = BlenderInteractiveSession(
     context=dict(CONTEXT),
     mesh_object_name=mesh_object.name,
     armature_object_name=armature_object.name,
+    original_bone_ids=set(initial_bone_snapshot),
+    bone_edit_snapshot=initial_bone_snapshot,
 )
 core.sessions[session.blender_session_id] = session
+
+# A model response may derive the Tail of an original leaf, but it must not
+# move that bone's Head.
+original_sibling_head = armature_object.data.edit_bones["sibling"].head.copy()
+original_sibling_tail = armature_object.data.edit_bones["sibling"].tail.copy()
+original_root_tail = armature_object.data.edit_bones["root"].tail.copy()
+extended_context = {
+    **CONTEXT,
+    "joints": [
+        *CONTEXT["joints"][:3],
+        [99.0, 99.0, 99.0],
+        [0.0, 2.0, 0.0],
+    ],
+    "parents": [-1, 0, 1, 0, 3],
+    "joint_names": [*CONTEXT["joint_names"], "sibling_child"],
+}
+core._apply_context_to_armature(
+    session,
+    extended_context,
+    select_name="sibling_child",
+    remove_missing=True,
+    mode_after="EDIT",
+)
+sibling = armature_object.data.edit_bones["sibling"]
+sibling_child = armature_object.data.edit_bones["sibling_child"]
+assert (sibling.head - original_sibling_head).length < 1e-6
+assert (sibling.tail - sibling_child.head).length < 1e-6
+assert not sibling_child.use_connect
+assert str(sibling.get(JOINT_ID_PROP, "")) in session.tail_follow_bone_ids
+assert (
+    armature_object.data.edit_bones["root"].tail - original_root_tail
+).length < 1e-6
+
+# User edits do not change a session-created bone into an original bone. The
+# next synchronized model context may therefore continue to update its Head.
+sibling_child.tail.z += 0.75
+bpy.context.view_layer.update()
+core.sync_context_from_armature(session)
+edited_child_id = str(sibling_child.get(JOINT_ID_PROP, ""))
+assert edited_child_id not in session.original_bone_ids
+attempted_move = {
+    **extended_context,
+    "joints": [*extended_context["joints"][:-1], [0.0, 3.0, 0.0]],
+}
+core._apply_context_to_armature(
+    session,
+    attempted_move,
+    select_name="sibling_child",
+    remove_missing=True,
+    mode_after="EDIT",
+)
+sibling_child = armature_object.data.edit_bones["sibling_child"]
+assert (sibling_child.head - sibling_child.parent.head).y > 1.9
+assert (
+    armature_object.data.edit_bones["sibling"].tail - sibling_child.head
+).length < 1e-6
+last_followed_tail = sibling_child.head.copy()
+restored_context = dict(CONTEXT)
+core._apply_context_to_armature(
+    session,
+    restored_context,
+    select_name="sibling",
+    remove_missing=True,
+    mode_after="EDIT",
+)
+assert "sibling_child" not in armature_object.data.edit_bones
+restored_sibling = armature_object.data.edit_bones["sibling"]
+assert (restored_sibling.tail - last_followed_tail).length < 1e-6
+assert (restored_sibling.tail - original_sibling_tail).length > 0.1
+session.context = restored_context
 
 
 def echo_session_request(current_session, payload):
@@ -132,6 +219,20 @@ addon._CORE = core
 assert addon.has_started_session(bpy.context)
 addon.ensure_armature_watch()
 assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
+
+# Tail-only edits are detected by the watcher and retained for original bones,
+# even though Tail itself is not sent to the server.
+tail_only_bone = armature_object.data.edit_bones["sibling"]
+tail_only_bone.tail.z += 0.2
+edited_tail = tail_only_bone.tail.copy()
+bpy.context.view_layer.update()
+assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
+assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
+assert addon._HISTORY_SYNC_PENDING
+addon._HISTORY_SYNC_DEADLINE = 0.0
+flush_timer(addon._flush_history_sync)
+assert session.bone_edit_snapshot == capture_armature_bone_states(armature_object)
+assert (armature_object.data.edit_bones["sibling"].tail - edited_tail).length < 1e-6
 
 bpy.ops.ed.undo_push(message="SkinTokens initial armature")
 for edit_bone in armature_object.data.edit_bones:
@@ -284,6 +385,8 @@ bpy.ops.object.mode_set(mode="OBJECT")
 finished_scene = bpy.context.scene
 finished_armature = bpy.data.objects.get(session.armature_object_name)
 assert finished_armature is not None
+finished_armature.show_in_front = True
+session.armature_show_in_front_before = False
 mesh_object["skintokens_blender_session_id"] = session.blender_session_id
 mesh_object["skintokens_model_session_id"] = session.model_session_id
 mesh_object["skintokens_source_obj"] = str(session.obj_path)
@@ -314,6 +417,41 @@ def reset_model_request(payload):
 
 
 core.model_request = reset_model_request
+core.sessions.pop(session.blender_session_id, None)
+stale_session = BlenderInteractiveSession(
+    blender_session_id="stale-blender-session",
+    model_session_id="stale-model-session",
+    obj_path=ROOT / "tests" / "stale.obj",
+    context=dict(CONTEXT),
+    mesh_object_name=mesh_object.name,
+    armature_object_name=finished_armature.name,
+    armature_show_in_front_before=False,
+)
+core.sessions[stale_session.blender_session_id] = stale_session
+mesh_object["skintokens_blender_session_id"] = stale_session.blender_session_id
+mesh_object["skintokens_model_session_id"] = stale_session.model_session_id
+finished_armature.show_in_front = True
+addon._clear_stale_sessions_before_start(bpy.context, core)
+deadline = time.monotonic() + 5.0
+while not reset_requests and time.monotonic() < deadline:
+    time.sleep(0.01)
+assert stale_session.blender_session_id not in core.sessions
+assert not finished_armature.show_in_front
+assert reset_requests == [
+    {
+        "command": "reset",
+        "session_id": "stale-model-session",
+        "end_reason": "start_replaced",
+    }
+]
+assert "skintokens_blender_session_id" not in mesh_object
+assert "skintokens_model_session_id" not in mesh_object
+reset_requests.clear()
+core.sessions[session.blender_session_id] = session
+finished_scene.skintokens_blender_session_id = session.blender_session_id
+mesh_object["skintokens_blender_session_id"] = session.blender_session_id
+mesh_object["skintokens_model_session_id"] = session.model_session_id
+finished_armature.show_in_front = True
 addon._queue_history_sync(60.0)
 assert bpy.app.timers.is_registered(addon._flush_history_sync)
 assert bpy.ops.skintokens_interactive.finish() == {"FINISHED"}
@@ -322,6 +460,7 @@ while not reset_requests and time.monotonic() < deadline:
     time.sleep(0.01)
 assert finished_scene.skintokens_blender_session_id == ""
 assert session.blender_session_id not in core.sessions
+assert not finished_armature.show_in_front
 assert reset_requests == [
     {
         "command": "reset",

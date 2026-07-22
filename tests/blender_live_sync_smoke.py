@@ -17,7 +17,7 @@ import bpy  # type: ignore  # noqa: E402
 extension_packages = [
     name
     for name in bpy.context.preferences.addons.keys()
-    if name.endswith(".skintokens_interactive")
+    if name.endswith(".h3d_skintokens")
 ]
 if extension_packages:
     assert len(extension_packages) == 1, extension_packages

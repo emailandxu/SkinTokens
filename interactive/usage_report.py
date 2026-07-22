@@ -17,6 +17,12 @@ DEFAULT_USAGE_DIR = RUNTIME_DIR / "usage"
 def build_usage_report(events: list[dict]) -> dict:
     starts = [event for event in events if event.get("event") == "session_start"]
     ends = [event for event in events if event.get("event") == "session_end"]
+    installs = [
+        event for event in events if event.get("event") == "extension_install"
+    ]
+    updates = [
+        event for event in events if event.get("event") == "extension_update"
+    ]
     started_ids = {str(event.get("session_id", "")) for event in starts}
     ended_ids = {str(event.get("session_id", "")) for event in ends}
     client_ips = {
@@ -31,6 +37,13 @@ def build_usage_report(events: list[dict]) -> dict:
         "sessions_ended": len(ends),
         "sessions_incomplete": len(started_ids - ended_ids),
         "sessions_finished": int(reasons.get("finish", 0)),
+        "extension_installs": len(installs),
+        "extension_updates": len(updates),
+        "extension_installations": len({
+            str(event.get("installation_id", ""))
+            for event in [*installs, *updates]
+            if str(event.get("installation_id", ""))
+        }),
         "sessions_lru_evicted": int(reasons.get("lru_evicted", 0)),
         "sessions_idle_timed_out": int(reasons.get("idle_timeout", 0)),
         "unique_client_ips": len(client_ips),

@@ -17,6 +17,7 @@ from .apply_skin import (
     apply_mesh_skin_weights,
     armature_by_name,
     armature_for_mesh,
+    capture_armature_bone_states,
     ensure_mesh_armature,
     import_skin_output,
     parse_armature_object,
@@ -61,6 +62,27 @@ def same_skeleton_context(left: dict, right: dict) -> bool:
         )
         for left_joint, right_joint in zip(left_joints, right_joints)
     )
+
+
+def same_armature_bone_states(left: dict, right: dict) -> bool:
+    if left.keys() != right.keys():
+        return False
+    for joint_id, left_state in left.items():
+        right_state = right[joint_id]
+        if left_state[:2] != right_state[:2]:
+            return False
+        for left_point, right_point in zip(left_state[2:], right_state[2:]):
+            if any(
+                not math.isclose(
+                    float(left_value),
+                    float(right_value),
+                    rel_tol=1e-7,
+                    abs_tol=1e-6,
+                )
+                for left_value, right_value in zip(left_point, right_point)
+            ):
+                return False
+    return True
 
 
 def scene_armature_context(
@@ -119,6 +141,7 @@ class BlenderInteractiveSession:
     context: dict
     mesh_object_name: str | None = None
     armature_object_name: str | None = None
+    armature_show_in_front_before: bool = False
     blender_to_obj_text: Optional[np.ndarray] = field(default=None, repr=False)
     skin_generated: bool = False
     vae_base_skin: Optional[np.ndarray] = field(default=None, repr=False)
@@ -128,6 +151,9 @@ class BlenderInteractiveSession:
     )
     vae_levels: Dict[str, int] = field(default_factory=dict, repr=False)
     vae_last_applied_skin: Optional[np.ndarray] = field(default=None, repr=False)
+    original_bone_ids: set[str] = field(default_factory=set, repr=False)
+    tail_follow_bone_ids: set[str] = field(default_factory=set, repr=False)
+    bone_edit_snapshot: dict = field(default_factory=dict, repr=False)
 
     def clear_vae_cache(self) -> None:
         self.vae_base_skin = None
@@ -267,6 +293,8 @@ class BlenderInteractiveCore:
         armature_obj = armature_by_name(session.armature_object_name)
         if armature_obj is None:
             raise RuntimeError("interactive session armature is unavailable")
+        current_bone_states = capture_armature_bone_states(armature_obj)
+        session.bone_edit_snapshot = current_bone_states
         joints, parents, names = parse_armature_object(armature_obj)
         edited = {
             **session.context,
@@ -286,6 +314,11 @@ class BlenderInteractiveCore:
             return False
         armature_obj = armature_by_name(session.armature_object_name)
         if armature_obj is None:
+            return False
+        if session.bone_edit_snapshot and not same_armature_bone_states(
+            session.bone_edit_snapshot,
+            capture_armature_bone_states(armature_obj),
+        ):
             return False
         joints, parents, names = parse_armature_object(armature_obj)
         current = {
@@ -328,6 +361,8 @@ class BlenderInteractiveCore:
         select_name: str | None,
         remove_missing: bool = False,
         mode_after: str | None = None,
+        allow_remove_names: set[str] | None = None,
+        allow_reparent_names: set[str] | None = None,
     ) -> None:
         if not session.armature_object_name:
             raise RuntimeError("interactive session has no armature")
@@ -339,7 +374,20 @@ class BlenderInteractiveCore:
             select_name=select_name,
             remove_missing=remove_missing,
             mode_after=mode_after,
+            session_id=session.blender_session_id,
+            original_bone_ids=session.original_bone_ids,
+            tail_follow_bone_ids=session.tail_follow_bone_ids,
+            allow_remove_names=allow_remove_names,
+            allow_reparent_names=allow_reparent_names,
         )
+        armature_obj = armature_by_name(session.armature_object_name)
+        if armature_obj is None:
+            raise RuntimeError("interactive session armature is unavailable")
+        joints, parents, names = parse_armature_object(armature_obj)
+        context["joints"] = joints
+        context["parents"] = parents
+        context["joint_names"] = names
+        session.bone_edit_snapshot = capture_armature_bone_states(armature_obj)
 
     def sync_context_to_model(self, session: BlenderInteractiveSession) -> dict:
         payload = {
@@ -518,6 +566,11 @@ class BlenderInteractiveCore:
                 if armature_obj.mode in {"EDIT", "POSE"}
                 else "OBJECT"
             )
+        initial_bone_states = (
+            {}
+            if armature_context is None
+            else capture_armature_bone_states(armature_obj)
+        )
         return {
             "ok": True,
             "obj_path": str(Path(obj_path).expanduser().resolve()),
@@ -526,6 +579,12 @@ class BlenderInteractiveCore:
             "initial_context": copy.deepcopy(initial_context),
             "context_source": context_source,
             "result_mode": result_mode,
+            "initial_bone_states": initial_bone_states,
+            "armature_show_in_front_before": (
+                False
+                if armature_context is None
+                else bool(getattr(armature_obj, "show_in_front", False))
+            ),
             "payload": {
                 "command": "start",
                 "obj_path": str(Path(obj_path).expanduser().resolve()),
@@ -576,9 +635,15 @@ class BlenderInteractiveCore:
             return False
         if armature_context is None:
             return False
-        return same_skeleton_context(
+        if not same_skeleton_context(
             prepared["initial_context"],
             armature_context[2],
+        ):
+            return False
+        expected_bone_states = prepared.get("initial_bone_states", {})
+        return not expected_bone_states or same_armature_bone_states(
+            expected_bone_states,
+            capture_armature_bone_states(armature_context[1]),
         )
 
     def apply_start_request(self, prepared: dict, result: dict) -> dict:
@@ -595,7 +660,12 @@ class BlenderInteractiveCore:
                 mesh_object_name,
                 str(armature_object_name),
             )
+        armature_show_in_front_before = bool(
+            prepared.get("armature_show_in_front_before", False)
+        )
+        armature_obj.show_in_front = True
         blender_session_id = uuid.uuid4().hex
+        initial_bone_snapshot = capture_armature_bone_states(armature_obj)
         session = BlenderInteractiveSession(
             blender_session_id=blender_session_id,
             model_session_id=str(started["session_id"]),
@@ -603,6 +673,9 @@ class BlenderInteractiveCore:
             context=started.get("context", {}),
             mesh_object_name=mesh_object_name,
             armature_object_name=str(armature_obj.name),
+            armature_show_in_front_before=armature_show_in_front_before,
+            original_bone_ids=set(initial_bone_snapshot),
+            bone_edit_snapshot=initial_bone_snapshot,
         )
         self._update_coordinate_mapping(session, started)
         self.sessions[blender_session_id] = session
@@ -625,6 +698,7 @@ class BlenderInteractiveCore:
             )
         except Exception:
             self.sessions.pop(blender_session_id, None)
+            armature_obj.show_in_front = armature_show_in_front_before
             raise
         return {
             "ok": True,
@@ -966,6 +1040,7 @@ class BlenderInteractiveCore:
             "mode_after": self._result_mode(session),
             "split_joint_index": new_mid_index,
             "split_child_name": names[child],
+            "split_reparent_names": [names[index] for index in children],
             "remote": self.prepare_session_request(session, payload),
         }
 
@@ -982,6 +1057,7 @@ class BlenderInteractiveCore:
             select_name=str(prepared["selected_name"]),
             remove_missing=True,
             mode_after=str(prepared["mode_after"]),
+            allow_reparent_names=set(prepared["split_reparent_names"]),
         )
         session.context = response["context"]
         self._clear_vae_state(session)
@@ -1041,6 +1117,11 @@ class BlenderInteractiveCore:
             )
             operation = "delete"
         removed_name = names[removed]
+        reparented_names = [
+            names[index]
+            for index, parent in enumerate(parents)
+            if parent == removed
+        ]
         keep = [index for index in range(len(joints)) if index != removed]
         old_to_new = {old: new for new, old in enumerate(keep)}
         new_parents = []
@@ -1069,6 +1150,7 @@ class BlenderInteractiveCore:
             "mode_after": self._result_mode(session),
             "deleted_bone_name": removed_name,
             "delete_operation": operation,
+            "reparented_names": reparented_names,
             "remote": self.prepare_session_request(session, payload),
         }
 
@@ -1085,6 +1167,8 @@ class BlenderInteractiveCore:
             select_name=prepared.get("select_name"),
             remove_missing=True,
             mode_after=str(prepared["mode_after"]),
+            allow_remove_names={str(prepared["deleted_bone_name"])},
+            allow_reparent_names=set(prepared["reparented_names"]),
         )
         session.context = response["context"]
         self._clear_vae_state(session)
@@ -1677,6 +1761,9 @@ class BlenderInteractiveCore:
     ) -> dict:
         session = self.sessions.pop(blender_session_id)
         self._clear_vae_state(session)
+        armature = armature_by_name(session.armature_object_name)
+        if armature is not None:
+            armature.show_in_front = session.armature_show_in_front_before
         return {
             "command": "reset",
             "session_id": session.model_session_id,

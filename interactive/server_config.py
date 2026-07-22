@@ -12,7 +12,6 @@ DEFAULT_SERVER_CONFIG_PATH = RUNTIME_DIR / "server.json"
 DEFAULT_SERVER_CONFIG: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
-    "socket": "interactive_model.sock",
     "model_ckpt": (
         "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt"
     ),
@@ -36,9 +35,9 @@ _RUNTIME_PATH_KEYS = {
     "asset_dir",
     "blender_extensions_dir",
     "result_dir",
-    "socket",
     "usage_dir",
 }
+_DEPRECATED_CONFIG_KEYS = {"socket"}
 
 
 def _write_default_config(path: Path) -> None:
@@ -63,6 +62,8 @@ def load_server_config(
     loaded = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
         raise ValueError(f"server config must contain a JSON object: {config_path}")
+    for key in _DEPRECATED_CONFIG_KEYS:
+        loaded.pop(key, None)
     unknown = sorted(set(loaded) - set(DEFAULT_SERVER_CONFIG))
     if unknown:
         raise ValueError(f"unknown server config keys: {', '.join(unknown)}")

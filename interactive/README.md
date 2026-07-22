@@ -1,4 +1,4 @@
-# SkinTokens Interactive MVP
+# H3D Skintokens Interactive Service
 
 This directory is additive. It imports the existing SkinTokens code but does
 not require edits outside `interactive/`.
@@ -42,7 +42,7 @@ this registry; Reset/Finish removes it with the session.
 ## Start The HTTP Model Server
 
 ```bash
-uv run python -m interactive.http_server \
+uv run python -m interactive.server \
   --host 0.0.0.0 \
   --port 8765 \
   --device cuda \
@@ -96,7 +96,7 @@ generate the signed-size/hash index:
 blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
-cp dist/skintokens_interactive-1.8.6.zip \
+cp dist/h3d_skintokens-1.0.0.zip \
   .runtime/blender_extensions/
 blender --command extension server-generate \
   --repo-dir .runtime/blender_extensions
@@ -111,22 +111,22 @@ Register and install it in Blender:
 
 ```bash
 blender --online-mode --command extension repo-add skintokens \
-  --name "SkinTokens Blender Extensions" \
+  --name "H3D Skintokens Extensions" \
   --url http://SERVER:8765/blender/extensions/
 blender --online-mode --command extension install \
-  --sync --enable skintokens_interactive
+  --sync --enable h3d_skintokens
 ```
 
 Subsequent versions can be installed with
 `blender --online-mode --command extension update --sync`. The health response reports
-whether the repository is ready and its latest `skintokens_interactive`
+whether the repository is ready and its latest `h3d_skintokens`
 version. Blender requests also send their installed Extension version for
 session usage reporting.
 
 CPU mode is available for debugging:
 
 ```bash
-uv run python -m interactive.http_server --host 127.0.0.1 --device cpu
+uv run python -m interactive.server --host 127.0.0.1 --device cpu
 ```
 
 Use `127.0.0.1` when Blender and the model are on the same machine. For another
@@ -179,18 +179,18 @@ blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
 blender --command extension validate \
-  dist/skintokens_interactive-1.8.6.zip
+  dist/h3d_skintokens-1.0.0.zip
 ```
 
 Install the ZIP with `Preferences > Extensions > Install from Disk`. Enable
-Online Access, then configure and test the model service URL in the extension
+Online Access, then test the read-only model service URL in the extension
 preferences. The release archive intentionally excludes the model, checkpoint,
 development launcher, local socket server, tests, and caches.
 
 Start the HTTP model server first:
 
 ```bash
-uv run python -m interactive.http_server --host 127.0.0.1 --device cuda
+uv run python -m interactive.server --host 127.0.0.1 --device cuda
 ```
 
 Then launch Blender with the addon registered and `xiaobaozi.obj` loaded:
@@ -246,7 +246,7 @@ The model service rejects skeletons above `--max-context-bones` instead of
 silently deleting bones. The default limit is 96. For example:
 
 ```bash
-uv run python -m interactive.http_server \
+uv run python -m interactive.server \
   --host 0.0.0.0 \
   --device cuda \
   --max-context-bones 96 \
@@ -370,8 +370,8 @@ callback.
 The model service appends two privacy-limited lifecycle events for each
 session: `session_start` after Start has successfully loaded the mesh, and
 `session_end` when Finish/Reset, session-record LRU eviction, addon unload, or
-service shutdown releases it. Events are stored as daily UTC JSONL files under
-`.runtime/usage/YYYY-MM-DD.jsonl` by default. Use `--usage-dir PATH` on either
+service shutdown releases it. Events are stored in one append-only JSONL file,
+`.runtime/usage/events.jsonl`, by default. Use `--usage-dir PATH` on either
 model-server entry point to place them elsewhere.
 
 Start records the anonymous client/session IDs, source IP address,

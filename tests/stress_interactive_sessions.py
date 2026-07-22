@@ -22,8 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from interactive.asset_store import MeshAssetStore
-from interactive.http_server import InteractiveHttpApi
-from interactive.server import InteractiveModelServer
+from interactive.server import InteractiveHttpApi, InteractiveModelServer
 from interactive.session import SessionRecord
 
 
