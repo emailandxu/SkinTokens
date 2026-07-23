@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from interactive.server import InteractiveModelServer
 from interactive.session import SessionRecord
 from interactive.usage_events import UsageEventLog, load_usage_events
+from interactive.usage_dashboard import build_usage_dashboard
 from interactive.usage_report import build_usage_report, main as usage_report_main
 
 
@@ -121,6 +122,35 @@ class UsageEventLogTest(unittest.TestCase):
             self.assertEqual(report["extension_installs"], 1)
             self.assertEqual(report["extension_updates"], 1)
             self.assertEqual(report["extension_installations"], 1)
+
+    def test_dashboard_returns_limited_newest_events_and_summary(self) -> None:
+        events = [
+            {"event": "session_start", "time_utc": "2026-07-22T10:00:00Z"},
+            {
+                "event": "extension_install",
+                "time_utc": "2026-07-22T10:01:00Z",
+                "installation_id": "install-a",
+            },
+            {
+                "event": "extension_update",
+                "time_utc": "2026-07-22T10:02:00Z",
+                "installation_id": "install-a",
+                "previous_version": "1.0.0",
+                "extension_version": "1.0.1",
+                "owner_id": "not-exposed",
+            },
+        ]
+
+        dashboard = build_usage_dashboard(events, limit=2)
+
+        self.assertTrue(dashboard["ok"])
+        self.assertEqual(dashboard["event_count"], 3)
+        self.assertEqual(dashboard["summary"]["extension_updates"], 1)
+        self.assertEqual(
+            [event["event"] for event in dashboard["recent_events"]],
+            ["extension_update", "extension_install"],
+        )
+        self.assertNotIn("owner_id", dashboard["recent_events"][0])
 
 
 class UsageLifecycleTest(unittest.TestCase):

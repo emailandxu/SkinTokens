@@ -67,7 +67,8 @@ from .skeleton_stream import (
     reorder_skeleton_context,
     similar_subtree_order,
 )
-from .usage_events import UsageEventLog
+from .usage_dashboard import USAGE_DASHBOARD_HTML, build_usage_dashboard
+from .usage_events import UsageEventLog, load_usage_events
 
 
 MIDPROCESS_NONE = "none"
@@ -1040,6 +1041,9 @@ class InteractiveHttpApi:
             weakref.WeakValueDictionary()
         )
         self.session_locks_guard = threading.Lock()
+        self.usage_cache_lock = threading.Lock()
+        self.usage_cache_key: tuple | None = None
+        self.usage_cache_events: list[dict] = []
         self.app = Bottle()
         self._register_routes()
 
@@ -1053,6 +1057,24 @@ class InteractiveHttpApi:
     def _session_lock(self, session_id: str) -> threading.Lock:
         with self.session_locks_guard:
             return self.session_locks.setdefault(session_id, threading.Lock())
+
+    def _usage_events(self) -> list[dict]:
+        usage_events = getattr(self.service, "usage_events", None)
+        if usage_events is None:
+            return []
+        files = sorted(usage_events.root.glob("*.jsonl"))
+        try:
+            cache_key = tuple(
+                (str(path), path.stat().st_size, path.stat().st_mtime_ns)
+                for path in files
+            )
+        except OSError:
+            cache_key = None
+        with self.usage_cache_lock:
+            if cache_key is None or cache_key != self.usage_cache_key:
+                self.usage_cache_events = load_usage_events(usage_events.root)
+                self.usage_cache_key = cache_key
+            return list(self.usage_cache_events)
 
     def _blender_extensions_status(self) -> dict:
         root = self.blender_extensions_dir
@@ -1169,6 +1191,24 @@ class InteractiveHttpApi:
             payload = self.service.status()
             payload["blender_extensions"] = self._blender_extensions_status()
             return self._set_status(payload)
+
+        def usage_dashboard():
+            response.content_type = "text/html; charset=UTF-8"
+            response.set_header("Cache-Control", "no-store")
+            return USAGE_DASHBOARD_HTML
+
+        app.get("/usage", callback=usage_dashboard)
+        app.get("/usage/", callback=usage_dashboard)
+
+        @app.get("/v1/usage/summary")
+        def usage_summary() -> Response:
+            try:
+                limit = max(1, min(int(request.query.get("limit", 100)), 500))
+            except (TypeError, ValueError):
+                return self._set_status(err("usage event limit must be an integer"))
+            return self._set_status(
+                build_usage_dashboard(self._usage_events(), limit=limit)
+            )
 
         def extension_index():
             return self._serve_blender_extension_file("index.json", index=True)

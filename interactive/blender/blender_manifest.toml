@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "h3d_skintokens"
-version = "1.0.0"
+version = "1.0.7"
 name = "H3D Skintokens"
 tagline = "Generate and edit rigs and skin weights with H3D Skintokens"
 maintainer = "H3D"

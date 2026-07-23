@@ -16,16 +16,12 @@ import bpy  # type: ignore
 from bpy.app.handlers import persistent  # type: ignore
 
 from .apply_skin import (
-    capture_armature_bone_states,
-    parse_armature_object,
     promote_active_armature_bone_selection,
     selected_skin_bone_names,
 )
 from .core import (
     DEFAULT_VAE_RECONSTRUCTION_MAX_LEVEL,
     BlenderInteractiveCore,
-    same_armature_bone_states,
-    same_skeleton_context,
 )
 from .transport import (
     DEFAULT_MODEL_URL,
@@ -44,10 +40,6 @@ _VAE_LEVEL_SETTING = False
 _LEGACY_PREVIEW_COLLECTION = "SkinTokens Interactive Preview"
 _ASYNC_JOB: dict | None = None
 _ASYNC_POLL_REGISTERED = False
-_ARMATURE_WATCH_TIMER_REGISTERED = False
-_ARMATURE_WATCH_SESSION_ID = ""
-_ARMATURE_WATCH_SIGNATURE: tuple | None = None
-_ARMATURE_WATCH_INTERVAL = 0.15
 _DEBUG_LOG_PATH = Path(tempfile.gettempdir()) / "skintokens_interactive_debug.log"
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
@@ -143,7 +135,7 @@ class SKINTOKENS_Preferences(bpy.types.AddonPreferences):
     def draw(self, _context) -> None:
         layout = self.layout
         server_row = layout.row()
-        server_row.enabled = False
+        server_row.enabled = not async_busy()
         server_row.prop(self, "server_url")
         layout.prop(self, "request_timeout")
         layout.operator("skintokens_interactive.test_connection", icon="URL")
@@ -552,6 +544,16 @@ def _poll_async_job() -> float | None:
     future = job["future"]
     if not future.done():
         return 0.05
+    if job.get("abort_on_transform") and _transform_modal_running():
+        _debug_log(
+            "async.deferred_transform",
+            label=str(job.get("label", "")),
+        )
+        _ASYNC_JOB = None
+        _ASYNC_POLL_REGISTERED = False
+        _queue_history_sync(0.1)
+        _redraw_sidebar()
+        return None
 
     context = bpy.context
     try:
@@ -584,6 +586,7 @@ def submit_async(
     apply: Callable[[dict], dict],
     success: Callable[[object, dict], None],
     undo_label: str | None = None,
+    abort_on_transform: bool = False,
 ) -> bool:
     global _ASYNC_JOB, _ASYNC_POLL_REGISTERED
     if async_busy():
@@ -595,6 +598,7 @@ def submit_async(
         "apply": apply,
         "success": success,
         "undo_label": undo_label,
+        "abort_on_transform": bool(abort_on_transform),
     }
     set_status(context, f"{label}中...")
     if not _ASYNC_POLL_REGISTERED:
@@ -646,14 +650,18 @@ def selected_vae_bone_name(context) -> str | None:
     return names[0] if len(names) == 1 else None
 
 
-def has_vae_preview(context) -> bool:
+def has_selected_vae_cache(context) -> bool:
     if _CORE is None:
         return False
     session_id = getattr(context.scene, "skintokens_blender_session_id", "")
     session = _CORE.sessions.get(session_id)
     if session is None:
         return False
-    return any(level > 0 for level in session.vae_levels.values())
+    bone_name = selected_vae_bone_name(context)
+    return bool(
+        bone_name is not None
+        and bone_name in session.vae_weight_fields
+    )
 
 
 def has_started_session(context) -> bool:
@@ -716,61 +724,70 @@ def set_vae_reconstruction_level(_scene, value: int) -> None:
             raise RuntimeError(
                 "请激活一个蒙皮顶点组，或只选择一根骨骼"
             )
-        core = get_core(context)
-        prepared = core.prepare_vae_reconstruction_level(
+        response = get_core(context).set_cached_vae_reconstruction_level(
             session_id,
             int(value),
         )
-        if not prepared.get("ok"):
-            raise RuntimeError(prepared.get("error", "VAE 重建失败"))
-        if not prepared["needs_remote"]:
-            response = core._apply_vae_level(prepared)
-            if not response.get("ok"):
-                raise RuntimeError(response.get("error", "VAE 重建失败"))
-            _report_vae_result(context, response, bone_name)
-            return
-
-        def apply_vae(result: dict) -> dict:
-            response = core.apply_session_request(
-                result["remote"],
-                result["remote_result"],
-            )
-            if not response.get("ok"):
-                return response
-            if not core.prepared_vae_skin_is_current(prepared):
-                session = core.sessions.get(session_id)
-                if session is not None:
-                    session.clear_vae_cache()
-                _queue_history_sync()
-                return {
-                    "ok": False,
-                    "code": "STALE_RESULT",
-                    "error": (
-                        "VAE 重建期间骨架或权重发生变化，结果已丢弃"
-                    ),
-                }
-            return core._apply_vae_level(
-                prepared,
-                response=response,
-                trajectory=result["trajectory"],
-            )
-
-        submit_async(
-            context,
-            label="VAE 重建",
-            work=lambda: core.execute_vae_request(prepared),
-            apply=apply_vae,
-            success=lambda result_context, response: _report_vae_result(
-                result_context,
-                response,
-                bone_name,
-            ),
-        )
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "缓存级别切换失败"))
+        _report_vae_result(context, response, bone_name)
     except Exception as exc:
         traceback.print_exc()
         set_status(context, f"权重场递归重建切换失败：{exc}")
     finally:
         _VAE_LEVEL_SETTING = False
+
+
+def _schedule_vae_cache_generation(context) -> bool:
+    if async_busy():
+        raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
+    session_id = context.scene.skintokens_blender_session_id
+    if not session_id:
+        raise RuntimeError("请先开始会话")
+    bone_name = selected_vae_bone_name(context)
+    if bone_name is None:
+        raise RuntimeError("请激活一个蒙皮顶点组，或只选择一根骨骼")
+    if has_selected_vae_cache(context):
+        raise RuntimeError("当前骨骼已经生成重建缓存")
+    core = get_core(context)
+    prepared = core.prepare_vae_reconstruction_level(session_id, 1)
+    if not prepared.get("ok"):
+        raise RuntimeError(prepared.get("error", "VAE 重建失败"))
+
+    def apply_vae(result: dict) -> dict:
+        response = core.apply_session_request(
+            result["remote"],
+            result["remote_result"],
+        )
+        if not response.get("ok"):
+            return response
+        if not core.prepared_vae_skin_is_current(prepared):
+            session = core.sessions.get(session_id)
+            if session is not None:
+                session.clear_vae_cache()
+            _queue_history_sync()
+            return {
+                "ok": False,
+                "code": "STALE_RESULT",
+                "error": "VAE 重建期间骨架或权重发生变化，结果已丢弃",
+            }
+        return core._apply_vae_level(
+            prepared,
+            response=response,
+            trajectory=result["trajectory"],
+        )
+
+    return submit_async(
+        context,
+        label="权重场递归重建",
+        work=lambda: core.execute_vae_request(prepared),
+        apply=apply_vae,
+        success=lambda result_context, response: _report_vae_result(
+            result_context,
+            response,
+            bone_name,
+        ),
+    )
 
 
 def selected_start_objects(context):
@@ -819,8 +836,11 @@ def source_obj_path(context, obj) -> Path:
     return export_selected_obj(context, obj)
 
 
-def _clear_stale_sessions_before_start(context, core: BlenderInteractiveCore) -> None:
-    stale_ids = set(core.sessions)
+def _clear_stale_sessions_before_start(
+    context,
+    core: BlenderInteractiveCore | None,
+) -> None:
+    stale_ids = set() if core is None else set(core.sessions)
     for obj in bpy.data.objects:
         marker = obj.get("skintokens_blender_session_id")
         if marker:
@@ -828,9 +848,8 @@ def _clear_stale_sessions_before_start(context, core: BlenderInteractiveCore) ->
     if not stale_ids:
         return
     cancel_history_sync()
-    cancel_armature_watch()
     for session_id in sorted(stale_ids):
-        if session_id in core.sessions:
+        if core is not None and session_id in core.sessions:
             try:
                 payload = core.detach_session(
                     session_id,
@@ -851,6 +870,11 @@ def _clear_stale_sessions_before_start(context, core: BlenderInteractiveCore) ->
                 del obj[key]
 
 
+def _restart_core_for_start(context) -> BlenderInteractiveCore:
+    _clear_stale_sessions_before_start(context, _CORE)
+    return get_core(context)
+
+
 def _flush_history_sync() -> float | None:
     global _HISTORY_SYNCING, _HISTORY_SYNC_PENDING, _HISTORY_TIMER_REGISTERED
     remaining = _HISTORY_SYNC_DEADLINE - time.monotonic()
@@ -859,9 +883,13 @@ def _flush_history_sync() -> float | None:
     if async_busy():
         _debug_log("history.flush_waiting", busy_label=_ASYNC_JOB["label"])
         return 0.1
-    _HISTORY_TIMER_REGISTERED = False
     if not _HISTORY_SYNC_PENDING:
+        _HISTORY_TIMER_REGISTERED = False
         return None
+    if _transform_modal_running():
+        _debug_log("history.deferred_transform")
+        return 0.1
+    _HISTORY_TIMER_REGISTERED = False
     _HISTORY_SYNC_PENDING = False
     if _CORE is None or _HISTORY_SYNCING:
         return None
@@ -926,6 +954,7 @@ def _flush_history_sync() -> float | None:
             work=lambda: core.execute_session_request(prepared["remote"]),
             apply=apply_sync,
             success=succeeded,
+            abort_on_transform=True,
         )
     except Exception as exc:
         _debug_log("history.failed", session_id=session_id, error=str(exc))
@@ -934,6 +963,43 @@ def _flush_history_sync() -> float | None:
     finally:
         _HISTORY_SYNCING = False
     return None
+
+
+def _transform_modal_running() -> bool:
+    modal_operators = getattr(
+        bpy.context.window_manager,
+        "modal_operators",
+        None,
+    )
+    if modal_operators is None:
+        return False
+    try:
+        items = list(modal_operators)
+    except TypeError:
+        items = []
+    for operator in items:
+        bl_idname = str(
+            getattr(
+                getattr(operator, "bl_rna", None),
+                "identifier",
+                "",
+            )
+        )
+        if bl_idname.startswith("TRANSFORM_OT_"):
+            return True
+    getter = getattr(modal_operators, "get", None)
+    return bool(
+        callable(getter)
+        and any(
+            getter(identifier) is not None
+            for identifier in (
+                "TRANSFORM_OT_translate",
+                "TRANSFORM_OT_rotate",
+                "TRANSFORM_OT_resize",
+                "TRANSFORM_OT_transform",
+            )
+        )
+    )
 
 
 def _queue_history_sync(delay: float = 0.0) -> None:
@@ -954,124 +1020,6 @@ def _queue_history_sync(delay: float = 0.0) -> None:
         _flush_history_sync,
         first_interval=max(0.0, float(delay)),
     )
-
-
-def _armature_context_signature(context: dict) -> tuple:
-    return (
-        tuple(
-            tuple(float(value) for value in joint)
-            for joint in context.get("joints", [])
-        ),
-        tuple(int(parent) for parent in context.get("parents", [])),
-        tuple(str(name) for name in context.get("joint_names", [])),
-    )
-
-
-def _watch_active_armature() -> float | None:
-    global _ARMATURE_WATCH_TIMER_REGISTERED
-    global _ARMATURE_WATCH_SESSION_ID, _ARMATURE_WATCH_SIGNATURE
-
-    if _CORE is None:
-        _ARMATURE_WATCH_TIMER_REGISTERED = False
-        _ARMATURE_WATCH_SESSION_ID = ""
-        _ARMATURE_WATCH_SIGNATURE = None
-        return None
-    scene = getattr(bpy.context, "scene", None)
-    session_id = "" if scene is None else str(
-        getattr(scene, "skintokens_blender_session_id", "")
-    )
-    session = _CORE.sessions.get(session_id)
-    if session is None or not session.armature_object_name:
-        _ARMATURE_WATCH_TIMER_REGISTERED = False
-        _ARMATURE_WATCH_SESSION_ID = ""
-        _ARMATURE_WATCH_SIGNATURE = None
-        return None
-    armature_obj = bpy.data.objects.get(session.armature_object_name)
-    if armature_obj is None:
-        return _ARMATURE_WATCH_INTERVAL
-
-    try:
-        promote_active_armature_bone_selection(session.armature_object_name)
-        joints, parents, names = parse_armature_object(armature_obj)
-    except (RuntimeError, ValueError):
-        return _ARMATURE_WATCH_INTERVAL
-    current = {
-        "joints": joints,
-        "parents": parents,
-        "joint_names": names,
-    }
-    current_bone_states = capture_armature_bone_states(armature_obj)
-    signature = (
-        _armature_context_signature(current),
-        tuple(sorted(current_bone_states.items())),
-    )
-    if session_id != _ARMATURE_WATCH_SESSION_ID:
-        _ARMATURE_WATCH_SESSION_ID = session_id
-        _ARMATURE_WATCH_SIGNATURE = signature
-        _debug_log(
-            "watch.session",
-            session_id=session_id,
-            joints=joints,
-            bone=_debug_bone_state(armature_obj),
-        )
-        return _ARMATURE_WATCH_INTERVAL
-    if signature != _ARMATURE_WATCH_SIGNATURE:
-        _ARMATURE_WATCH_SIGNATURE = signature
-        _debug_log(
-            "watch.changed",
-            session_id=session_id,
-            joints=joints,
-            bone=_debug_bone_state(armature_obj),
-        )
-        return _ARMATURE_WATCH_INTERVAL
-
-    if (
-        (
-            not same_skeleton_context(session.context, current)
-            or (
-                bool(session.bone_edit_snapshot)
-                and not same_armature_bone_states(
-                    session.bone_edit_snapshot,
-                    current_bone_states,
-                )
-            )
-        )
-        and not _HISTORY_SYNC_PENDING
-        and not _HISTORY_SYNCING
-    ):
-        _debug_log(
-            "watch.mismatch",
-            session_id=session_id,
-            session_joints=session.context.get("joints", []),
-            armature_joints=joints,
-            bone=_debug_bone_state(armature_obj),
-        )
-        _queue_history_sync()
-    return _ARMATURE_WATCH_INTERVAL
-
-
-def ensure_armature_watch() -> None:
-    global _ARMATURE_WATCH_TIMER_REGISTERED
-    if _ARMATURE_WATCH_TIMER_REGISTERED:
-        return
-    _ARMATURE_WATCH_TIMER_REGISTERED = True
-    _debug_log("watch.started", interval=_ARMATURE_WATCH_INTERVAL)
-    bpy.app.timers.register(
-        _watch_active_armature,
-        first_interval=_ARMATURE_WATCH_INTERVAL,
-        persistent=True,
-    )
-
-
-def cancel_armature_watch() -> None:
-    global _ARMATURE_WATCH_TIMER_REGISTERED
-    global _ARMATURE_WATCH_SESSION_ID, _ARMATURE_WATCH_SIGNATURE
-    if bpy.app.timers.is_registered(_watch_active_armature):
-        bpy.app.timers.unregister(_watch_active_armature)
-    _ARMATURE_WATCH_TIMER_REGISTERED = False
-    _ARMATURE_WATCH_SESSION_ID = ""
-    _ARMATURE_WATCH_SIGNATURE = None
-    _debug_log("watch.stopped")
 
 
 @persistent
@@ -1411,8 +1359,7 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                 raise RuntimeError(f"正在执行“{_ASYNC_JOB['label']}”，请稍候")
             obj, armature_obj = selected_start_objects(context)
             obj_path = source_obj_path(context, obj)
-            core = get_core(context)
-            _clear_stale_sessions_before_start(context, core)
+            core = _restart_core_for_start(context)
             prepared = core.prepare_start(
                 obj_path,
                 import_mesh=False,
@@ -1457,7 +1404,6 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                     )
                 else:
                     set_status(result_context, "会话已开始，已创建空骨架")
-                ensure_armature_watch()
 
             def apply_start(result: dict) -> dict:
                 response = result["response"]
@@ -1518,7 +1464,6 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
             return {"CANCELLED"}
 
         cancel_history_sync()
-        cancel_armature_watch()
         configured_output = context.scene.skintokens_output_path.strip()
         saved_path = None
         save_error = None
@@ -1701,6 +1646,22 @@ class SKINTOKENS_OT_refresh(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+class SKINTOKENS_OT_vae_generate(bpy.types.Operator):
+    bl_idname = "skintokens_interactive.vae_generate"
+    bl_label = "权重场递归重建"
+    bl_description = "为当前骨骼生成 0-3 级递归重建缓存，并预览 1 级"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        try:
+            _schedule_vae_cache_generation(context)
+            return {"FINISHED"}
+        except Exception as exc:
+            traceback.print_exc()
+            set_status(context, f"权重场递归重建失败：{exc}")
+            return {"CANCELLED"}
+
+
 class SKINTOKENS_OT_vae_apply(bpy.types.Operator):
     bl_idname = "skintokens_interactive.vae_apply"
     bl_label = "应用权重场递归重建"
@@ -1814,7 +1775,7 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
         scene = context.scene
         url_row = layout.row(align=True)
         url_value = url_row.row(align=True)
-        url_value.enabled = False
+        url_value.enabled = not async_busy()
         preferences = get_addon_preferences(context)
         if preferences is None:
             url_value.prop(scene, "skintokens_model_socket")
@@ -1841,11 +1802,15 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
                     "skintokens_interactive.enable_online_access",
                     icon="CHECKMARK",
                 )
-        generate_row = layout.row(align=True)
+        global_box = layout.box()
+        global_box.label(text="全局生成")
+        generate_row = global_box.row(align=True)
         generate_row.enabled = has_started_session(context) and not async_busy()
         generate_row.operator("skintokens_interactive.rig", icon="OUTLINER_OB_ARMATURE")
         generate_row.operator("skintokens_interactive.skin", icon="MOD_ARMATURE")
-        commands = layout.column()
+        bone_box = layout.box()
+        bone_box.label(text="逐骨骼操作")
+        commands = bone_box.column()
         commands.enabled = has_started_session(context) and not async_busy()
         next_row = commands.row(align=True)
         next_row.operator("skintokens_interactive.next", icon="TRACKING_FORWARDS")
@@ -1853,17 +1818,28 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
         edit_row = commands.row(align=True)
         edit_row.operator("skintokens_interactive.split", icon="ADD")
         edit_row.operator("skintokens_interactive.delete", icon="REMOVE")
-        vae_row = commands.split(factor=0.86, align=True)
-        slider_row = vae_row.row(align=True)
-        slider_row.enabled = selected_vae_bone_name(context) is not None
+        vae_row = commands.split(factor=0.5, align=True)
+        generate_vae_row = vae_row.row(align=True)
+        generate_vae_row.enabled = (
+            selected_vae_bone_name(context) is not None
+            and not has_selected_vae_cache(context)
+        )
+        generate_vae_row.operator(
+            "skintokens_interactive.vae_generate",
+            text="权重递归重建",
+            icon="FILE_REFRESH",
+        )
+        vae_controls = vae_row.split(factor=0.82, align=True)
+        slider_row = vae_controls.row(align=True)
+        slider_row.enabled = has_selected_vae_cache(context)
         slider_row.prop(
             scene,
             "skintokens_vae_reconstruction_level",
-            text="权重场递归重建",
+            text="重建级别",
             slider=True,
         )
-        apply_row = vae_row.row(align=True)
-        apply_row.enabled = has_vae_preview(context)
+        apply_row = vae_controls.row(align=True)
+        apply_row.enabled = has_selected_vae_cache(context)
         apply_row.operator(
             "skintokens_interactive.vae_apply",
             text="",
@@ -1906,6 +1882,7 @@ classes = (
     SKINTOKENS_OT_rig,
     SKINTOKENS_OT_skin,
     SKINTOKENS_OT_refresh,
+    SKINTOKENS_OT_vae_generate,
     SKINTOKENS_OT_vae_apply,
     SKINTOKENS_OT_split,
     SKINTOKENS_OT_delete,
@@ -1977,7 +1954,6 @@ def unregister():
             sync_model_after_armature_change
         )
     cancel_history_sync()
-    cancel_armature_watch()
     cancel_async_job()
     _cancel_extension_repository_sync()
     _cancel_extension_event_report()

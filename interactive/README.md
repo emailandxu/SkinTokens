@@ -96,7 +96,7 @@ generate the signed-size/hash index:
 blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
-cp dist/h3d_skintokens-1.0.0.zip \
+cp dist/h3d_skintokens-1.0.7.zip \
   .runtime/blender_extensions/
 blender --command extension server-generate \
   --repo-dir .runtime/blender_extensions
@@ -179,11 +179,11 @@ blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
 blender --command extension validate \
-  dist/h3d_skintokens-1.0.0.zip
+  dist/h3d_skintokens-1.0.7.zip
 ```
 
 Install the ZIP with `Preferences > Extensions > Install from Disk`. Enable
-Online Access, then test the read-only model service URL in the extension
+Online Access, then configure and test the model service URL in the extension
 preferences. The release archive intentionally excludes the model, checkpoint,
 development launcher, local socket server, tests, and caches.
 
@@ -397,6 +397,21 @@ The report includes started/ended/incomplete sessions, unique source IP count,
 end-reason counts, successful Skin uses, bone changes, and duration statistics.
 A Start without a matching End, for example after a process crash, remains an
 incomplete session instead of being counted as completed work.
+
+The HTTP service also exposes a read-only Chinese dashboard at `/usage` and
+the underlying JSON payload at `/v1/usage/summary`. The dashboard shows
+aggregate session, Skin, bone-change, install, update, timeout, and LRU metrics,
+plus the 100 newest lifecycle events. It refreshes every 30 seconds and can be
+refreshed manually. The reader caches parsed events until a JSONL file changes,
+so an idle dashboard does not repeatedly scan the full log.
+
+Extension lifecycle reports use `extension_install` for the first successful
+load and `extension_update` after a different installed version has loaded and
+successfully reported to the service. Merely discovering an available update
+or pressing the Update button is not counted as a completed update. The
+dashboard includes client IP addresses and currently follows the HTTP service's
+existing network access policy; expose it only on a trusted network unless an
+authentication layer is added.
 
 ## One-Shot Script Entry Point
 

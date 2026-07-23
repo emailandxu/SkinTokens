@@ -16,10 +16,15 @@ import numpy as np
 DEFAULT_MODEL_URL = "http://172.17.60.251:8765"
 PROTOCOL_VERSION = 1
 EXTENSION_PACKAGE_ID = "h3d_skintokens"
-EXTENSION_VERSION = "1.0.0"
+EXTENSION_VERSION = "1.0.7"
 
 Request = Dict[str, Any]
 Response = Dict[str, Any]
+
+
+def ascii_header_value(value: Any, *, limit: int = 200) -> str:
+    text = str(value)[:limit]
+    return text.encode("ascii", errors="backslashreplace").decode("ascii")
 
 
 def encode_float32_array(values: np.ndarray) -> dict[str, Any]:
@@ -84,7 +89,7 @@ def request(
         headers.update(
             {
                 "Content-Type": "application/octet-stream",
-                "X-SkinTokens-Filename": obj_path.name,
+                "X-SkinTokens-Filename": ascii_header_value(obj_path.name),
                 "X-SkinTokens-Initial-Bones": str(
                     max(0, int(payload.get("initial_bone_count", 0)))
                 ),

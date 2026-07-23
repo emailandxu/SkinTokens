@@ -5,8 +5,8 @@ SkinTokens model service. The extension uploads the selected mesh, lets users
 generate or edit an armature, and applies generated skin weights in Blender.
 
 After installing the extension from disk, enable Blender Online Access and use
-**Test Connection** before starting a session. The published server URL is
-shown read-only in the extension UI. Mesh geometry is sent to that service.
+**Test Connection** before starting a session. The server URL can be edited in
+the extension UI. Mesh geometry is sent to that service.
 When Online Access is disabled, the H3D Skintokens sidebar provides an **Allow
 Online Access** button. If Blender was launched with `--offline-mode`, restart
 it without that option first.

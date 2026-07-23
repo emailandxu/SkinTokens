@@ -1452,6 +1452,51 @@ class BlenderInteractiveCore:
             return 0
         return int(session.vae_levels.get(str(bone_name), 0))
 
+    def set_cached_vae_reconstruction_level(
+        self,
+        blender_session_id: str,
+        level: int,
+    ) -> dict:
+        session = self.sessions[blender_session_id]
+        if not session.mesh_object_name:
+            return {"ok": False, "error": "session has no mesh object"}
+        joint_names = [str(name) for name in session.context.get("joint_names", [])]
+        selected_names = selected_skin_bone_names(session.mesh_object_name)
+        if len(selected_names) != 1:
+            return {
+                "ok": False,
+                "error": "activate exactly one skin vertex group or select exactly one pose bone",
+            }
+        bone_name = selected_names[0]
+        fields = session.vae_weight_fields.get(bone_name)
+        if session.vae_base_skin is None or fields is None:
+            return {
+                "ok": False,
+                "code": "VAE_CACHE_MISSING",
+                "error": "generate the reconstruction cache before changing levels",
+            }
+        level = int(level)
+        max_level = len(fields) - 1
+        if level < 0 or level > max_level:
+            return {
+                "ok": False,
+                "error": f"VAE reconstruction level must be between 0 and {max_level}",
+            }
+        if bone_name not in joint_names:
+            return {
+                "ok": False,
+                "error": f"selected bone is not part of the SkinTokens skeleton: {bone_name}",
+            }
+        return self._apply_vae_level({
+            "blender_session_id": blender_session_id,
+            "bone_name": bone_name,
+            "bone_index": joint_names.index(bone_name),
+            "joint_names": joint_names,
+            "level": level,
+            "max_level": max_level,
+            "cache_invalidated": False,
+        })
+
     def prepare_vae_reconstruction_level(
         self,
         blender_session_id: str,
@@ -1707,7 +1752,7 @@ class BlenderInteractiveCore:
         applied_levels = {
             name: int(level)
             for name, level in session.vae_levels.items()
-            if int(level) > 0
+            if name in session.vae_weight_fields
         }
         if not applied_levels or session.vae_last_applied_skin is None:
             return {"ok": False, "error": "choose a VAE level above 0 first"}

@@ -311,8 +311,26 @@ class InteractiveHttpTest(unittest.TestCase):
         self.assertTrue(started["ok"])
         self.assertEqual(
             self.service.calls[0]["blender_extension_version"],
-            "1.0.0",
+            "1.0.7",
         )
+
+    def test_chinese_obj_filename_is_safe_for_http_headers(self) -> None:
+        chinese_obj = Path(self.temporary.name) / "中文模型.obj"
+        chinese_obj.write_text(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+            encoding="utf-8",
+        )
+
+        for transport in (request, blender_request):
+            started = transport(
+                self.endpoint,
+                {
+                    "command": "start",
+                    "obj_path": str(chinese_obj),
+                    "owner_id": "chinese-filename",
+                },
+            )
+            self.assertTrue(started["ok"])
 
     def test_extension_install_and_update_events_are_logged(self) -> None:
         for action, previous_version, version in (
@@ -342,6 +360,38 @@ class InteractiveHttpTest(unittest.TestCase):
         )
         self.assertEqual(events[0]["client_ip"], "127.0.0.1")
         self.assertEqual(events[1]["previous_version"], "1.0.0")
+
+    def test_usage_dashboard_and_summary_include_extension_updates(self) -> None:
+        self.service.usage_events.append(
+            "extension_install",
+            client_ip="192.0.2.1",
+            installation_id="installation-a",
+            extension_version="1.0.0",
+            installation_source="repository",
+        )
+        self.service.usage_events.append(
+            "extension_update",
+            client_ip="192.0.2.1",
+            installation_id="installation-a",
+            previous_version="1.0.0",
+            extension_version="1.0.1",
+            installation_source="repository",
+        )
+
+        with urlopen(f"{self.endpoint}/usage") as result:
+            page = result.read().decode("utf-8")
+            self.assertEqual(result.headers["Cache-Control"], "no-store")
+            self.assertEqual(result.headers.get_content_type(), "text/html")
+        self.assertIn("H3D Skintokens", page)
+        self.assertIn("近期事件", page)
+
+        with urlopen(f"{self.endpoint}/v1/usage/summary?limit=1") as result:
+            dashboard = json.loads(result.read().decode("utf-8"))
+        self.assertEqual(dashboard["summary"]["extension_installs"], 1)
+        self.assertEqual(dashboard["summary"]["extension_updates"], 1)
+        self.assertEqual(dashboard["summary"]["extension_installations"], 1)
+        self.assertEqual(len(dashboard["recent_events"]), 1)
+        self.assertEqual(dashboard["recent_events"][0]["event"], "extension_update")
 
     def test_infer_cli_uses_running_http_service(self) -> None:
         output_path = Path(self.temporary.name) / "infer" / "skin.txt"
@@ -1671,7 +1721,7 @@ class BlenderRecoveryTest(unittest.TestCase):
         self.assertIn("no skin weights", result["error"])
         core.session_request.assert_not_called()
 
-    def test_vae_slider_caches_all_levels_for_one_bone(self) -> None:
+    def test_vae_button_generates_cache_and_slider_stays_local(self) -> None:
         core = BlenderInteractiveCore("http://model.example", owner_id="client-a")
         context = {
             "joints": [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
@@ -1723,11 +1773,11 @@ class BlenderRecoveryTest(unittest.TestCase):
         ):
             first = core.set_selected_skin_reconstruction_level(
                 session.blender_session_id,
-                3,
+                1,
             )
             first_applied = applied.call_args.args[2].copy()
             read_skin.return_value = first_applied
-            second = core.set_selected_skin_reconstruction_level(
+            second = core.set_cached_vae_reconstruction_level(
                 session.blender_session_id,
                 2,
             )
@@ -1743,6 +1793,10 @@ class BlenderRecoveryTest(unittest.TestCase):
                 "foot",
             )
             read_skin.return_value = manually_edited
+            missing_cache = core.set_cached_vae_reconstruction_level(
+                session.blender_session_id,
+                3,
+            )
             after_edit = core.set_selected_skin_reconstruction_level(
                 session.blender_session_id,
                 3,
@@ -1761,6 +1815,8 @@ class BlenderRecoveryTest(unittest.TestCase):
         self.assertEqual(committed["level"], 0)
         self.assertEqual(committed["applied_levels"], {"foot": 2})
         self.assertEqual(level_after_apply, 0)
+        self.assertFalse(missing_cache["ok"])
+        self.assertEqual(missing_cache["code"], "VAE_CACHE_MISSING")
         self.assertTrue(after_edit["generated"])
         self.assertEqual(core.session_request.call_count, 2)
         self.assertEqual(applied.call_count, 3)

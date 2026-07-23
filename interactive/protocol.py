@@ -22,6 +22,11 @@ Request = Dict[str, Any]
 Response = Dict[str, Any]
 
 
+def ascii_header_value(value: Any, *, limit: int = 200) -> str:
+    text = str(value)[:limit]
+    return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 def encode_float32_array(values: np.ndarray) -> dict[str, Any]:
     array = np.ascontiguousarray(values, dtype="<f4")
     compressed = zlib.compress(array.tobytes(order="C"), level=6)
@@ -90,7 +95,7 @@ def _http_request(endpoint: str | Path, payload: Request) -> Response:
         url = f"{base_url}/v1/sessions"
         headers.update({
             "Content-Type": "application/octet-stream",
-            "X-SkinTokens-Filename": obj_path.name,
+            "X-SkinTokens-Filename": ascii_header_value(obj_path.name),
             "X-SkinTokens-Initial-Bones": str(
                 max(0, int(payload.get("initial_bone_count", 0)))
             ),

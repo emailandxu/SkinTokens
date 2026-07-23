@@ -84,6 +84,7 @@ assert addon.SKINTOKENS_OT_force_next.bl_label == "强制衍生子骨骼"
 assert addon.SKINTOKENS_OT_rig.bl_label == "生成骨骼树"
 assert addon.SKINTOKENS_OT_split.bl_label == "拆分骨骼"
 assert addon.SKINTOKENS_OT_delete.bl_label == "收合子骨骼"
+assert addon.SKINTOKENS_OT_vae_generate.bl_label == "权重场递归重建"
 assert bpy.types.Scene.bl_rna.properties[
     "skintokens_vae_reconstruction_level"
 ].name == "权重场递归重建"
@@ -217,22 +218,60 @@ def echo_model_request(payload):
 core.model_request = echo_model_request
 addon._CORE = core
 assert addon.has_started_session(bpy.context)
-addon.ensure_armature_watch()
-assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
 
-# Tail-only edits are detected by the watcher and retained for original bones,
-# even though Tail itself is not sent to the server.
-tail_only_bone = armature_object.data.edit_bones["sibling"]
-tail_only_bone.tail.z += 0.2
-edited_tail = tail_only_bone.tail.copy()
-bpy.context.view_layer.update()
-assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
-assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
+# Transform modal operations retain the dirty state until the transform ends.
+original_transform_check = addon._transform_modal_running
+original_prepare_history_sync = core.prepare_history_sync
+prepare_called = False
+
+
+def unexpected_prepare(_session_id):
+    global prepare_called
+    prepare_called = True
+    raise AssertionError("history sync prepared during Transform modal")
+
+
+addon._transform_modal_running = lambda: True
+core.prepare_history_sync = unexpected_prepare
+addon._queue_history_sync()
+if bpy.app.timers.is_registered(addon._flush_history_sync):
+    bpy.app.timers.unregister(addon._flush_history_sync)
+assert addon._flush_history_sync() == 0.1
 assert addon._HISTORY_SYNC_PENDING
+assert not prepare_called
+core.prepare_history_sync = original_prepare_history_sync
+addon._transform_modal_running = lambda: False
 addon._HISTORY_SYNC_DEADLINE = 0.0
 flush_timer(addon._flush_history_sync)
-assert session.bone_edit_snapshot == capture_armature_bone_states(armature_object)
-assert (armature_object.data.edit_bones["sibling"].tail - edited_tail).length < 1e-6
+assert not addon._HISTORY_SYNC_PENDING
+
+async_applied = False
+
+
+def unexpected_apply(_result):
+    global async_applied
+    async_applied = True
+    raise AssertionError("async result applied during Transform modal")
+
+
+addon.submit_async(
+    bpy.context,
+    label="骨架同步",
+    work=lambda: {"ok": True},
+    apply=unexpected_apply,
+    success=lambda _context, _response: None,
+    abort_on_transform=True,
+)
+addon._transform_modal_running = lambda: True
+addon._ASYNC_JOB["future"].result(timeout=5)
+if bpy.app.timers.is_registered(addon._poll_async_job):
+    bpy.app.timers.unregister(addon._poll_async_job)
+assert addon._poll_async_job() is None
+assert not async_applied
+assert not addon.async_busy()
+assert addon._HISTORY_SYNC_PENDING
+addon.cancel_history_sync()
+addon._transform_modal_running = original_transform_check
 
 bpy.ops.ed.undo_push(message="SkinTokens initial armature")
 for edit_bone in armature_object.data.edit_bones:
@@ -245,21 +284,11 @@ armature_object.data.edit_bones.active = sibling
 bpy.context.view_layer.update()
 assert sibling.select and sibling.select_head and sibling.select_tail
 addon.cancel_history_sync()
-bpy.app.handlers.depsgraph_update_post.remove(
-    addon.sync_model_after_armature_change
-)
 sibling.head.x += 0.5
 sibling.tail.x += 0.5
 bpy.context.view_layer.update()
 bpy.ops.ed.undo_push(message="SkinTokens moved sibling")
-assert not addon._HISTORY_SYNC_PENDING
-assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
-assert not addon._HISTORY_SYNC_PENDING
-assert addon._watch_active_armature() == addon._ARMATURE_WATCH_INTERVAL
 assert addon._HISTORY_SYNC_PENDING
-bpy.app.handlers.depsgraph_update_post.append(
-    addon.sync_model_after_armature_change
-)
 addon._HISTORY_SYNC_DEADLINE = 0.0
 flush_timer(addon._flush_history_sync)
 assert abs(session.context["joints"][3][0] - 0.5) < 1e-6
@@ -446,6 +475,42 @@ assert reset_requests == [
 ]
 assert "skintokens_blender_session_id" not in mesh_object
 assert "skintokens_model_session_id" not in mesh_object
+
+# Start must dispose the old Core before reading changed server settings. This
+# covers Undo restoring Scene properties while the Python Core keeps a session.
+reset_requests.clear()
+core.sessions[stale_session.blender_session_id] = stale_session
+mesh_object["skintokens_blender_session_id"] = stale_session.blender_session_id
+mesh_object["skintokens_model_session_id"] = stale_session.model_session_id
+preferences = addon.get_addon_preferences(bpy.context)
+if preferences is None:
+    original_server_url = finished_scene.skintokens_model_socket
+    changed_server_url = "http://127.0.0.1:18765"
+    finished_scene.skintokens_model_socket = changed_server_url
+else:
+    original_server_url = preferences.server_url
+    changed_server_url = "http://127.0.0.1:18765"
+    preferences.server_url = changed_server_url
+addon._CORE = core
+replacement_core = addon._restart_core_for_start(bpy.context)
+deadline = time.monotonic() + 5.0
+while not reset_requests and time.monotonic() < deadline:
+    time.sleep(0.01)
+assert replacement_core is addon._CORE
+assert replacement_core is not core
+assert replacement_core.model_socket == changed_server_url
+assert reset_requests == [
+    {
+        "command": "reset",
+        "session_id": "stale-model-session",
+        "end_reason": "start_replaced",
+    }
+]
+if preferences is None:
+    finished_scene.skintokens_model_socket = original_server_url
+else:
+    preferences.server_url = original_server_url
+addon._CORE = core
 reset_requests.clear()
 core.sessions[session.blender_session_id] = session
 finished_scene.skintokens_blender_session_id = session.blender_session_id

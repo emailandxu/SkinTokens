@@ -97,7 +97,6 @@ def echo_model_request(payload):
 
 core.model_request = echo_model_request
 addon._CORE = core
-addon.ensure_armature_watch()
 deadline = time.monotonic() + 5.0
 
 
@@ -120,7 +119,7 @@ def check_sync() -> float | None:
     )
     request_finished = (
         not addon.async_busy()
-        and scene.skintokens_status == "Armature auto-synced: 2 joints"
+        and scene.skintokens_status == "骨架已自动同步：2 根骨骼"
     )
     if position_synced and parent_tail_refreshed and request_finished:
         print("SKINTOKENS_LIVE_SYNC_OK")
