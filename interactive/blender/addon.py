@@ -23,6 +23,19 @@ from .core import (
     DEFAULT_VAE_RECONSTRUCTION_MAX_LEVEL,
     BlenderInteractiveCore,
 )
+from .rig_postprocess import (
+    MIRROR_AXIS_X,
+    MIRROR_AXIS_Y,
+    MIRROR_AXIS_Z,
+    MIRROR_DISTANCE_AVERAGE,
+    MIRROR_DISTANCE_FARTHEST,
+    MIRROR_DISTANCE_NEAREST,
+    POSTPROCESS_READY_PROP,
+    RigPostprocessError,
+    mirror_align_bones,
+    rename_body_regions,
+    selected_edit_bone_names,
+)
 from .transport import (
     DEFAULT_MODEL_URL,
     EXTENSION_PACKAGE_ID,
@@ -671,6 +684,26 @@ def has_started_session(context) -> bool:
     return bool(session_id and session_id in _CORE.sessions)
 
 
+def session_armature(context):
+    if _CORE is None:
+        return None
+    session_id = getattr(context.scene, "skintokens_blender_session_id", "")
+    session = _CORE.sessions.get(session_id)
+    if session is None or not session.armature_object_name:
+        return None
+    armature = bpy.data.objects.get(session.armature_object_name)
+    if armature is None or armature.type != "ARMATURE":
+        return None
+    return armature
+
+
+def selected_session_edit_bone_names(context) -> tuple[str, ...]:
+    armature = session_armature(context)
+    if armature is None:
+        return ()
+    return selected_edit_bone_names(context, armature)
+
+
 def has_session_marker(context) -> bool:
     return bool(getattr(context.scene, "skintokens_blender_session_id", ""))
 
@@ -848,6 +881,18 @@ def _clear_stale_sessions_before_start(
     if not stale_ids:
         return
     cancel_history_sync()
+    finished_armatures = set()
+    if core is not None:
+        for session_id in stale_ids:
+            session = core.sessions.get(session_id)
+            if session is not None:
+                finished_armatures.add(str(session.armature_object_name))
+    for obj in bpy.data.objects:
+        if obj.get("skintokens_blender_session_id") not in stale_ids:
+            continue
+        source_armature = str(obj.get("skintokens_source_armature", ""))
+        if source_armature:
+            finished_armatures.add(source_armature)
     for session_id in sorted(stale_ids):
         if core is not None and session_id in core.sessions:
             try:
@@ -858,6 +903,10 @@ def _clear_stale_sessions_before_start(
                 _submit_server_cleanup(core, payload)
             except Exception:
                 traceback.print_exc()
+    for armature_name in finished_armatures:
+        armature = bpy.data.objects.get(armature_name)
+        if armature is not None and armature.type == "ARMATURE":
+            armature[POSTPROCESS_READY_PROP] = True
     context.scene.skintokens_blender_session_id = ""
     for obj in bpy.data.objects:
         if obj.get("skintokens_blender_session_id") not in stale_ids:
@@ -1392,9 +1441,11 @@ class SKINTOKENS_OT_start(bpy.types.Operator):
                 ]
                 mesh_obj["skintokens_source_obj"] = str(obj_path)
                 if response.get("armature_object_name"):
-                    mesh_obj["skintokens_source_armature"] = response[
-                        "armature_object_name"
-                    ]
+                    armature_name = response["armature_object_name"]
+                    mesh_obj["skintokens_source_armature"] = armature_name
+                    armature = bpy.data.objects.get(armature_name)
+                    if armature is not None and armature.type == "ARMATURE":
+                        armature[POSTPROCESS_READY_PROP] = False
                 remove_legacy_preview_objects()
                 joint_count = len(response.get("context", {}).get("joints", []))
                 if response.get("context_source") == "scene-armature":
@@ -1469,6 +1520,18 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
         save_error = None
         reset_error = None
         session = None if _CORE is None else _CORE.sessions.get(session_id)
+        finished_armature = None
+        if session is not None:
+            finished_armature = bpy.data.objects.get(session.armature_object_name)
+        if finished_armature is None:
+            for obj in bpy.data.objects:
+                if obj.get("skintokens_blender_session_id") != session_id:
+                    continue
+                source_name = str(obj.get("skintokens_source_armature", ""))
+                candidate = bpy.data.objects.get(source_name)
+                if candidate is not None and candidate.type == "ARMATURE":
+                    finished_armature = candidate
+                    break
         try:
             if configured_output:
                 destination = Path(configured_output).expanduser().resolve()
@@ -1495,6 +1558,8 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
             traceback.print_exc()
             reset_error = str(exc)
         finally:
+            if finished_armature is not None:
+                finished_armature[POSTPROCESS_READY_PROP] = True
             context.scene.skintokens_blender_session_id = ""
             for obj in bpy.data.objects:
                 if obj.get("skintokens_blender_session_id") != session_id:
@@ -1520,6 +1585,139 @@ class SKINTOKENS_OT_finish(bpy.types.Operator):
         else:
             set_status(context, "会话已结束，模型和蒙皮结果已保留")
         return {"FINISHED"}
+
+
+class SKINTOKENS_OT_semantic_rename(bpy.types.Operator):
+    bl_idname = "skintokens_interactive.semantic_rename"
+    bl_label = "身体分区命名"
+    bl_description = "按二足或四足模板识别身体分区并重命名通用骨骼"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        if async_busy():
+            cls.poll_message_set("请等待当前操作完成")
+            return False
+        armature = session_armature(context)
+        if armature is None:
+            cls.poll_message_set("请先开始 SkinTokens 会话")
+            return False
+        return True
+
+    def execute(self, context):
+        try:
+            armature = session_armature(context)
+            if armature is None:
+                raise RigPostprocessError("请先开始 SkinTokens 会话")
+            result = rename_body_regions(
+                context,
+                armature,
+                context.scene.skintokens_rig_template,
+            )
+            _queue_history_sync(0.0)
+            message = (
+                f"身体分区命名完成：识别 {result.classified_bones} 根，"
+                f"重命名 {result.renamed_bones} 根，"
+                f"建立 {result.mirror_pairs} 组镜像配对"
+            )
+            if result.warnings:
+                message = f"{message}；{'；'.join(result.warnings)}"
+            set_status(context, message)
+            self.report({"INFO"}, message)
+            return {"FINISHED"}
+        except Exception as exc:
+            traceback.print_exc()
+            message = f"身体分区命名失败：{exc}"
+            set_status(context, message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+
+class SKINTOKENS_OT_mirror_align(bpy.types.Operator):
+    bl_idname = "skintokens_interactive.mirror_align"
+    bl_label = "镜像对齐"
+    bl_description = (
+        "骨架编辑模式下高亮至少两根时对齐高亮骨骼，高亮零根或一根时对齐全部骨骼；"
+        "其他模式下也对齐全部骨骼；"
+        "不依赖骨骼名称，不修改权重和 Bone Roll，并保持连接关节相连"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        if async_busy():
+            cls.poll_message_set("请等待当前操作完成")
+            return False
+        armature = session_armature(context)
+        if armature is None:
+            cls.poll_message_set("请先开始 SkinTokens 会话")
+            return False
+        is_session_edit = (
+            context.object is armature and context.mode == "EDIT_ARMATURE"
+        )
+        selected_count = (
+            len(selected_edit_bone_names(context, armature))
+            if is_session_edit
+            else 0
+        )
+        scope_count = (
+            selected_count
+            if selected_count >= 2
+            else len(armature.data.bones)
+        )
+        if scope_count < 2:
+            cls.poll_message_set("当前会话骨架没有足够的骨骼")
+            return False
+        return True
+
+    def execute(self, context):
+        try:
+            armature = session_armature(context)
+            if armature is None:
+                raise RigPostprocessError("请先开始 SkinTokens 会话")
+            axis = context.scene.skintokens_mirror_axis
+            center = context.scene.skintokens_mirror_center
+            distance_mode = context.scene.skintokens_mirror_distance_mode
+            selected_subset = (
+                context.object is armature
+                and context.mode == "EDIT_ARMATURE"
+                and len(selected_edit_bone_names(context, armature)) >= 2
+            )
+            result = mirror_align_bones(
+                context,
+                armature,
+                axis=axis,
+                center=center,
+                distance_mode=distance_mode,
+            )
+            _queue_history_sync(0.0)
+            distance_label = {
+                MIRROR_DISTANCE_FARTHEST: "最远",
+                MIRROR_DISTANCE_NEAREST: "最近",
+                MIRROR_DISTANCE_AVERAGE: "平均",
+            }[distance_mode]
+            scope_label = "选中骨骼" if selected_subset else "全部骨骼"
+            message = (
+                f"镜像对齐完成：已按 {axis}={center:g}、{distance_label}距离"
+                f"在{scope_label}中对齐 {result.mirror_pairs} 组骨骼"
+            )
+            if result.skipped_bones:
+                names = ", ".join(result.skipped_bones[:4])
+                if len(result.skipped_bones) > 4:
+                    names = f"{names} 等"
+                message = (
+                    f"{message}；跳过 {len(result.skipped_bones)} 根未可靠配对骨骼："
+                    f"{names}"
+                )
+            set_status(context, message)
+            self.report({"INFO"}, message)
+            return {"FINISHED"}
+        except Exception as exc:
+            traceback.print_exc()
+            message = f"镜像对齐失败：{exc}"
+            set_status(context, message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
 
 
 class SKINTOKENS_OT_next(bpy.types.Operator):
@@ -1744,9 +1942,15 @@ class SKINTOKENS_OT_delete(bpy.types.Operator):
 
             def succeeded(result_context, response: dict) -> None:
                 count = len(response.get("context", {}).get("joints", []))
+                suffix = (
+                    "；骨架已变化，请重新生成蒙皮"
+                    if response.get("skin_invalidated")
+                    else ""
+                )
                 set_status(
                     result_context,
-                    f"已收合 {response.get('deleted_bone_name')}：共 {count} 根骨骼",
+                    f"已收合 {response.get('deleted_bone_name')}：共 {count} 根骨骼"
+                    f"{suffix}",
                 )
 
             _schedule_context_edit(
@@ -1845,6 +2049,60 @@ class SKINTOKENS_PT_interactive(bpy.types.Panel):
             text="",
             icon="CHECKMARK",
         )
+        rig_tools_box = layout.box()
+        rig_tools_box.label(text="骨架整理")
+        armature = session_armature(context)
+        rig_tools = rig_tools_box.column()
+        rig_tools.enabled = (
+            has_started_session(context)
+            and not async_busy()
+            and armature is not None
+        )
+        naming_row = rig_tools.row(align=True)
+        naming_row.prop(scene, "skintokens_rig_template", text="")
+        naming_row.operator(
+            "skintokens_interactive.semantic_rename",
+            icon="OUTLINER_DATA_ARMATURE",
+        )
+        plane_row = rig_tools.row(align=True)
+        plane_row.label(text="对称面")
+        plane_row.prop(scene, "skintokens_mirror_axis", text="")
+        plane_row.label(text="=")
+        plane_row.prop(scene, "skintokens_mirror_center", text="")
+        mirror_row = rig_tools.row(align=True)
+        mirror_row.prop(
+            scene,
+            "skintokens_mirror_distance_mode",
+            text="",
+        )
+        mirror_button = mirror_row.row(align=True)
+        is_session_edit = (
+            armature is not None
+            and context.object is armature
+            and context.mode == "EDIT_ARMATURE"
+        )
+        selected_count = (
+            len(selected_session_edit_bone_names(context))
+            if is_session_edit
+            else 0
+        )
+        scope_count = (
+            (
+                selected_count
+                if selected_count >= 2
+                else len(armature.data.bones)
+            )
+            if armature is not None
+            else 0
+        )
+        mirror_button.enabled = (
+            armature is not None
+            and scope_count >= 2
+        )
+        mirror_button.operator(
+            "skintokens_interactive.mirror_align",
+            icon="MOD_MIRROR",
+        )
         layout.separator()
         layout.label(text=scene.skintokens_status)
         state_row = layout.row()
@@ -1876,6 +2134,8 @@ classes = (
     SKINTOKENS_OT_enable_online_access,
     SKINTOKENS_OT_start,
     SKINTOKENS_OT_finish,
+    SKINTOKENS_OT_semantic_rename,
+    SKINTOKENS_OT_mirror_align,
     SKINTOKENS_OT_next,
     SKINTOKENS_OT_force_next,
     SKINTOKENS_OT_import_txt,
@@ -1913,6 +2173,61 @@ def register():
     )
     bpy.types.Scene.skintokens_blender_session_id = bpy.props.StringProperty(default="")
     bpy.types.Scene.skintokens_status = bpy.props.StringProperty(default="未开始")
+    bpy.types.Scene.skintokens_rig_template = bpy.props.EnumProperty(
+        name="骨架模板",
+        description="身体分区命名使用的拓扑模板",
+        items=(
+            (
+                "BIPED",
+                "二足",
+                "识别脊柱、头部、双臂、双腿和可选尾部",
+            ),
+            (
+                "QUADRUPED",
+                "四足",
+                "识别脊柱、头部、前后腿和尾部",
+            ),
+        ),
+        default="QUADRUPED",
+    )
+    bpy.types.Scene.skintokens_mirror_axis = bpy.props.EnumProperty(
+        name="对称轴",
+        description="选择 Armature 局部坐标中的轴；对称面不允许旋转",
+        items=(
+            (MIRROR_AXIS_X, "X", "使用 Armature 局部坐标平面 X=指定值"),
+            (MIRROR_AXIS_Y, "Y", "使用 Armature 局部坐标平面 Y=指定值"),
+            (MIRROR_AXIS_Z, "Z", "使用 Armature 局部坐标平面 Z=指定值"),
+        ),
+        default=MIRROR_AXIS_X,
+    )
+    bpy.types.Scene.skintokens_mirror_center = bpy.props.FloatProperty(
+        name="对称面位置",
+        description="对称面在 Armature 局部坐标中的轴向位置",
+        default=0.0,
+        unit="LENGTH",
+    )
+    bpy.types.Scene.skintokens_mirror_distance_mode = bpy.props.EnumProperty(
+        name="对齐距离",
+        description="左右点对齐后到对称面的目标距离",
+        items=(
+            (
+                MIRROR_DISTANCE_FARTHEST,
+                "最远",
+                "两侧都采用原来离对称面较远一侧的距离",
+            ),
+            (
+                MIRROR_DISTANCE_NEAREST,
+                "最近",
+                "两侧都采用原来离对称面较近一侧的距离",
+            ),
+            (
+                MIRROR_DISTANCE_AVERAGE,
+                "平均",
+                "两侧都采用原有两个距离的平均值",
+            ),
+        ),
+        default=MIRROR_DISTANCE_AVERAGE,
+    )
     bpy.types.Scene.skintokens_vae_reconstruction_level = bpy.props.IntProperty(
         name="权重场递归重建",
         description=(
@@ -1962,6 +2277,11 @@ def unregister():
     if core is not None:
         for session_id in list(core.sessions):
             try:
+                session = core.sessions.get(session_id)
+                if session is not None:
+                    armature = bpy.data.objects.get(session.armature_object_name)
+                    if armature is not None and armature.type == "ARMATURE":
+                        armature[POSTPROCESS_READY_PROP] = True
                 _submit_server_cleanup(
                     core,
                     core.detach_session(
@@ -1991,6 +2311,10 @@ def unregister():
         "skintokens_blender_session_id",
         "skintokens_branch_parent",
         "skintokens_status",
+        "skintokens_rig_template",
+        "skintokens_mirror_axis",
+        "skintokens_mirror_center",
+        "skintokens_mirror_distance_mode",
         "skintokens_vae_reconstruction_level",
         "skintokens_max_new_tokens",
         "skintokens_skin_max_new_tokens",

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -12,6 +15,22 @@ PARENT_ID_PROP = "skintokens_parent_id"
 DFS_ORDER_PROP = "skintokens_dfs_order"
 MANAGED_BONE_PROP = "skintokens_managed_bone"
 CREATED_SESSION_PROP = "skintokens_created_session"
+MANAGED_VERTEX_GROUPS_PROP = "skintokens_managed_vertex_groups"
+
+_LEGACY_SEMANTIC_GROUP_PATTERN = re.compile(
+    r"^(?:spine|head|tail)_\d+$"
+    r"|^(?:arm|leg)_[lr]_\d+$"
+    r"|^leg_(?:front|hind)_[lr]_\d+$",
+    re.IGNORECASE,
+)
+_LEGACY_GENERIC_GROUP_PATTERN = re.compile(r"^bone_\d+$", re.IGNORECASE)
+_CURRENT_VERTEX_GROUP_WEIGHTS = object()
+
+
+@dataclass(frozen=True)
+class VertexGroupWeightSnapshot:
+    weights: tuple[float, ...]
+    managed: bool
 
 
 def _bpy():
@@ -24,6 +43,213 @@ def _mathutils():
     import mathutils  # type: ignore
 
     return mathutils
+
+
+def managed_vertex_group_names(mesh_obj, armature_obj=None) -> set[str]:
+    if mesh_obj is None or getattr(mesh_obj, "type", "") != "MESH":
+        return set()
+    if MANAGED_VERTEX_GROUPS_PROP in mesh_obj:
+        raw = mesh_obj.get(MANAGED_VERTEX_GROUPS_PROP, "[]")
+        try:
+            decoded = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return set()
+        if not isinstance(decoded, list):
+            return set()
+        return {
+            str(name)
+            for name in decoded
+            if isinstance(name, str) and name
+        }
+
+    if armature_obj is None:
+        armature_obj = armature_for_mesh(mesh_obj)
+    if armature_obj is None or getattr(armature_obj, "type", "") != "ARMATURE":
+        return set()
+
+    group_names = {str(group.name) for group in mesh_obj.vertex_groups}
+    bone_names = {str(bone.name) for bone in armature_obj.data.bones}
+    managed_bone_names = {
+        str(bone.name)
+        for bone in armature_obj.data.bones
+        if bool(bone.get(MANAGED_BONE_PROP, False))
+    }
+    managed = {
+        name
+        for name in group_names
+        if name in managed_bone_names
+        or (
+            bool(managed_bone_names)
+            and _LEGACY_GENERIC_GROUP_PATTERN.fullmatch(name)
+        )
+    }
+    if int(armature_obj.data.get("skintokens_semantic_version", 0)) > 0:
+        managed.update(
+            name
+            for name in group_names
+            if _LEGACY_SEMANTIC_GROUP_PATTERN.fullmatch(name)
+            and (name in bone_names or bool(managed_bone_names))
+        )
+    return managed
+
+
+def set_managed_vertex_group_names(mesh_obj, names: Sequence[str]) -> None:
+    unique = sorted({str(name) for name in names if str(name)})
+    mesh_obj[MANAGED_VERTEX_GROUPS_PROP] = json.dumps(
+        unique,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _prepare_managed_vertex_groups(mesh_obj, names: Sequence[str]) -> dict[str, object]:
+    current_names = tuple(dict.fromkeys(str(name) for name in names))
+    current = set(current_names)
+    previous = managed_vertex_group_names(mesh_obj)
+    for group in list(mesh_obj.vertex_groups):
+        if str(group.name) in previous - current:
+            mesh_obj.vertex_groups.remove(group)
+
+    vertex_ids = list(range(len(mesh_obj.data.vertices)))
+    groups = {}
+    for name in current_names:
+        group = mesh_obj.vertex_groups.get(name)
+        if group is None:
+            group = mesh_obj.vertex_groups.new(name=name)
+        if vertex_ids:
+            group.remove(vertex_ids)
+        groups[name] = group
+    return groups
+
+
+def capture_vertex_group_weights(
+    mesh_object_name: str,
+    group_name: str,
+) -> VertexGroupWeightSnapshot | None:
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+    group_name = str(group_name)
+    group = mesh_obj.vertex_groups.get(group_name)
+    if group is None:
+        return None
+    weights = []
+    for vertex in mesh_obj.data.vertices:
+        try:
+            weight = max(0.0, float(group.weight(int(vertex.index))))
+        except RuntimeError:
+            weight = 0.0
+        weights.append(weight)
+    return VertexGroupWeightSnapshot(
+        weights=tuple(weights),
+        managed=group_name in managed_vertex_group_names(mesh_obj),
+    )
+
+
+def transfer_managed_vertex_group_weights(
+    mesh_object_name: str,
+    source_name: str,
+    target_name: str | None,
+    *,
+    snapshot: VertexGroupWeightSnapshot | None | object = (
+        _CURRENT_VERTEX_GROUP_WEIGHTS
+    ),
+) -> bool:
+    bpy = _bpy()
+    mesh_obj = bpy.data.objects.get(mesh_object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+
+    source_name = str(source_name)
+    target_name = None if target_name is None else str(target_name)
+    managed = managed_vertex_group_names(mesh_obj)
+    if target_name == source_name:
+        return False
+
+    source = mesh_obj.vertex_groups.get(source_name)
+    if snapshot is _CURRENT_VERTEX_GROUP_WEIGHTS:
+        snapshot = capture_vertex_group_weights(mesh_object_name, source_name)
+    if snapshot is None:
+        return False
+    if not isinstance(snapshot, VertexGroupWeightSnapshot):
+        raise TypeError("invalid vertex-group weight snapshot")
+    if len(snapshot.weights) != len(mesh_obj.data.vertices):
+        raise RuntimeError(
+            f"mesh vertex count changed while deleting {source_name}: "
+            f"{len(snapshot.weights)} -> {len(mesh_obj.data.vertices)}"
+        )
+    source_was_managed = bool(snapshot.managed)
+
+    if target_name is not None:
+        target = mesh_obj.vertex_groups.get(target_name)
+        if target is None:
+            target = mesh_obj.vertex_groups.new(name=target_name)
+
+        for vertex, source_weight in zip(mesh_obj.data.vertices, snapshot.weights):
+            try:
+                target_weight = max(
+                    0.0,
+                    float(target.weight(int(vertex.index))),
+                )
+            except RuntimeError:
+                target_weight = 0.0
+            if source_weight > 0.0:
+                target.add(
+                    [int(vertex.index)],
+                    min(1.0, source_weight + target_weight),
+                    "REPLACE",
+                )
+
+    if source is not None:
+        mesh_obj.vertex_groups.remove(source)
+    managed.discard(source_name)
+    if target_name is not None and source_was_managed:
+        managed.add(target_name)
+    set_managed_vertex_group_names(mesh_obj, managed)
+    mesh_obj.data.update()
+    return target_name is not None
+
+
+def mesh_object_names_for_armature(armature_object_name: str | None) -> tuple[str, ...]:
+    armature_obj = armature_by_name(armature_object_name)
+    if armature_obj is None:
+        return ()
+    result = []
+    for obj in _bpy().data.objects:
+        if obj.type != "MESH":
+            continue
+        uses_modifier = any(
+            modifier.type == "ARMATURE" and modifier.object is armature_obj
+            for modifier in obj.modifiers
+        )
+        uses_parent = (
+            obj.parent is armature_obj
+            and str(getattr(obj, "parent_type", "")) == "ARMATURE"
+        )
+        if uses_modifier or uses_parent:
+            result.append(str(obj.name))
+    return tuple(result)
+
+
+def validate_vertex_group_transfer(
+    mesh_object_names: Sequence[str],
+    source_name: str,
+) -> None:
+    bpy = _bpy()
+    for mesh_object_name in mesh_object_names:
+        mesh_obj = bpy.data.objects.get(str(mesh_object_name))
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            raise RuntimeError(f"mesh object not found: {mesh_object_name}")
+        if mesh_obj.vertex_groups.get(str(source_name)) is None:
+            continue
+        if not bool(getattr(mesh_obj, "is_editable", True)) or not bool(
+            getattr(mesh_obj.data, "is_editable", True)
+        ):
+            raise RuntimeError(
+                f"mesh {mesh_object_name} is linked or read-only; "
+                f"cannot transfer weights for {source_name}"
+            )
 
 
 def parse_skin_txt(path: Path) -> dict[int, list[tuple[str, float]]]:
@@ -719,15 +945,9 @@ def apply_mesh_skin_weights(
     if weights.shape != expected_shape:
         raise ValueError(f"skin shape {weights.shape} does not match {expected_shape}")
 
-    vertex_ids = list(range(expected_shape[0]))
-    groups = []
-    for name in joint_names:
-        group = mesh_obj.vertex_groups.get(str(name))
-        if group is None:
-            group = mesh_obj.vertex_groups.new(name=str(name))
-        if vertex_ids:
-            group.remove(vertex_ids)
-        groups.append(group)
+    names = [str(name) for name in joint_names]
+    group_by_name = _prepare_managed_vertex_groups(mesh_obj, names)
+    groups = [group_by_name[name] for name in names]
 
     for bone_index, group in enumerate(groups):
         nonzero = np.flatnonzero(weights[:, bone_index] > float(eps))
@@ -737,6 +957,7 @@ def apply_mesh_skin_weights(
                 float(weights[vertex_index, bone_index]),
                 "REPLACE",
             )
+    set_managed_vertex_group_names(mesh_obj, names)
     mesh_obj.data.update()
 
 
@@ -918,10 +1139,7 @@ def import_skin_output(
 
     rows = parse_skin_txt(resolved)
     skin_names = sorted({name for weights in rows.values() for name, _ in weights})
-    for group in list(obj.vertex_groups):
-        if group.name in skin_names or group.name.startswith("bone_"):
-            obj.vertex_groups.remove(group)
-    group_by_name = {group.name: group for group in obj.vertex_groups}
+    group_by_name = _prepare_managed_vertex_groups(obj, skin_names)
     for vertex_id, weights in rows.items():
         if vertex_id >= len(obj.data.vertices):
             continue
@@ -931,6 +1149,7 @@ def import_skin_output(
                 group = obj.vertex_groups.new(name=name)
                 group_by_name[name] = group
             group.add([vertex_id], float(weight), "REPLACE")
+    set_managed_vertex_group_names(obj, skin_names)
 
     if joints is not None and parents is not None:
         if joint_names is None:

@@ -16,7 +16,7 @@ import numpy as np
 DEFAULT_MODEL_URL = "http://172.17.60.251:8765"
 PROTOCOL_VERSION = 1
 EXTENSION_PACKAGE_ID = "h3d_skintokens"
-EXTENSION_VERSION = "1.0.7"
+EXTENSION_VERSION = "1.0.8"
 
 Request = Dict[str, Any]
 Response = Dict[str, Any]

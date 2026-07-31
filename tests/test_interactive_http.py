@@ -8,7 +8,7 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
 from urllib.request import urlopen
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -311,7 +311,7 @@ class InteractiveHttpTest(unittest.TestCase):
         self.assertTrue(started["ok"])
         self.assertEqual(
             self.service.calls[0]["blender_extension_version"],
-            "1.0.7",
+            "1.0.8",
         )
 
     def test_chinese_obj_filename_is_safe_for_http_headers(self) -> None:
@@ -1432,6 +1432,19 @@ class BlenderRecoveryTest(unittest.TestCase):
             patch.object(core, "_result_mode", return_value="EDIT"),
             patch.object(core, "_apply_context_to_armature") as applied,
             patch(
+                "interactive.blender.core.mesh_object_names_for_armature",
+                return_value=("Mesh", "Accessory"),
+            ),
+            patch("interactive.blender.core.validate_vertex_group_transfer"),
+            patch(
+                "interactive.blender.core.capture_vertex_group_weights",
+                return_value=Mock(name="weight-snapshot"),
+            ) as captured,
+            patch(
+                "interactive.blender.core.transfer_managed_vertex_group_weights",
+                side_effect=(True, False),
+            ) as transferred,
+            patch(
                 "interactive.blender.core.active_armature_bone_name",
                 return_value="root",
             ),
@@ -1441,6 +1454,9 @@ class BlenderRecoveryTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["deleted_bone_name"], "branch")
         self.assertEqual(response["delete_operation"], "dissolve")
+        self.assertEqual(response["weight_target_name"], "root")
+        self.assertTrue(response["weights_transferred"])
+        self.assertFalse(response["skin_invalidated"])
         self.assertEqual(
             response["context"]["joint_names"],
             ["root", "leaf", "sibling"],
@@ -1454,6 +1470,23 @@ class BlenderRecoveryTest(unittest.TestCase):
             mode_after="EDIT",
             allow_remove_names={"branch"},
             allow_reparent_names={"leaf"},
+        )
+        self.assertEqual(response["weight_mesh_names"], ["Mesh", "Accessory"])
+        transferred.assert_has_calls(
+            [
+                call(
+                    "Mesh",
+                    "branch",
+                    "root",
+                    snapshot=captured.return_value,
+                ),
+                call(
+                    "Accessory",
+                    "branch",
+                    "root",
+                    snapshot=captured.return_value,
+                ),
+            ]
         )
 
     def test_delete_removes_the_active_leaf_itself(self) -> None:
@@ -1481,6 +1514,19 @@ class BlenderRecoveryTest(unittest.TestCase):
             patch.object(core, "_result_mode", return_value="EDIT"),
             patch.object(core, "_apply_context_to_armature") as applied,
             patch(
+                "interactive.blender.core.mesh_object_names_for_armature",
+                return_value=("Mesh",),
+            ),
+            patch("interactive.blender.core.validate_vertex_group_transfer"),
+            patch(
+                "interactive.blender.core.capture_vertex_group_weights",
+                return_value=Mock(name="weight-snapshot"),
+            ) as captured,
+            patch(
+                "interactive.blender.core.transfer_managed_vertex_group_weights",
+                return_value=True,
+            ) as transferred,
+            patch(
                 "interactive.blender.core.active_armature_bone_name",
                 return_value="leaf",
             ),
@@ -1490,6 +1536,9 @@ class BlenderRecoveryTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["deleted_bone_name"], "leaf")
         self.assertEqual(response["delete_operation"], "delete")
+        self.assertEqual(response["weight_target_name"], "root")
+        self.assertTrue(response["weights_transferred"])
+        self.assertFalse(response["skin_invalidated"])
         self.assertEqual(response["context"]["joint_names"], ["root"])
         self.assertEqual(response["context"]["parents"], [-1])
         applied.assert_called_once_with(
@@ -1500,6 +1549,12 @@ class BlenderRecoveryTest(unittest.TestCase):
             mode_after="EDIT",
             allow_remove_names={"leaf"},
             allow_reparent_names=set(),
+        )
+        transferred.assert_called_once_with(
+            "Mesh",
+            "leaf",
+            "root",
+            snapshot=captured.return_value,
         )
 
     def test_start_automatically_uses_scene_armature_as_context(self) -> None:

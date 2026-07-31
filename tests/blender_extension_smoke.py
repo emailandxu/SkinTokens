@@ -23,7 +23,7 @@ transport = importlib.import_module(f"{package_name}.transport")
 
 assert addon.__package__ == package_name
 assert transport.EXTENSION_PACKAGE_ID == "h3d_skintokens"
-assert transport.EXTENSION_VERSION == "1.0.7"
+assert transport.EXTENSION_VERSION == "1.0.8"
 assert addon.SKINTOKENS_PT_interactive.bl_label == "H3D Skintokens"
 assert addon.SKINTOKENS_PT_interactive.bl_category == "H3D Skintokens"
 assert hasattr(bpy.types.Scene, "skintokens_status")

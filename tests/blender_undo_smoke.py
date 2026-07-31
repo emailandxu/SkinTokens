@@ -19,8 +19,10 @@ from interactive.blender import addon  # noqa: E402
 from interactive.blender.apply_skin import (  # noqa: E402
     JOINT_ID_PROP,
     apply_armature_context,
+    apply_mesh_skin_weights,
     capture_armature_bone_states,
     ensure_mesh_armature,
+    managed_vertex_group_names,
     parse_armature_object,
 )
 from interactive.blender.core import (  # noqa: E402
@@ -278,11 +280,18 @@ for edit_bone in armature_object.data.edit_bones:
     edit_bone.select = False
     edit_bone.select_head = False
     edit_bone.select_tail = False
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
 sibling = armature_object.data.edit_bones["sibling"]
 sibling.select_head = True
 armature_object.data.edit_bones.active = sibling
 bpy.context.view_layer.update()
 assert sibling.select and sibling.select_head and sibling.select_tail
+assert addon.SKINTOKENS_OT_semantic_rename.poll(bpy.context)
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
+root = armature_object.data.edit_bones["root"]
+root.select = True
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
+root.select = False
 addon.cancel_history_sync()
 sibling.head.x += 0.5
 sibling.tail.x += 0.5
@@ -303,9 +312,13 @@ addon._HISTORY_SYNC_DEADLINE = 0.0
 flush_timer(addon._flush_history_sync)
 assert abs(session.context["joints"][3][0] - 0.5) < 1e-6
 
+# Outside the session armature's Edit Mode, mirror alignment is available and
+# treats the complete armature as selected.
+bpy.ops.object.mode_set(mode="OBJECT")
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
+
 # Split operates on the active bone's visible downstream segment. Selecting the
 # same upstream bone and dissolving removes the inserted joint again.
-bpy.ops.object.mode_set(mode="OBJECT")
 session.context = dict(CONTEXT)
 apply_armature_context(
     armature_object.name,
@@ -323,14 +336,109 @@ assert split["context"]["parents"] == [-1, 0, 1, 2, 1]
 assert armature_object.data.edit_bones["branch"].parent.name == "root_split"
 assert armature_object.data.edit_bones["sibling"].parent.name == "root_split"
 assert armature_object.data.edit_bones.active.name == "root"
+
+# Before the ownership manifest exists, semantic metadata identifies groups
+# created by an older SkinTokens version. Unrelated groups stay user-owned.
+armature_object.data["skintokens_semantic_version"] = 1
+stale_semantic = mesh_object.vertex_groups.new(name="spine_99")
+stale_semantic.add([0], 0.8, "REPLACE")
+artist_mask = mesh_object.vertex_groups.new(name="artist_mask")
+artist_mask.add([1], 0.6, "REPLACE")
+split_names = split["context"]["joint_names"]
+skin_before_collapse = np.asarray(
+    [
+        [0.3, 0.2, 0.2, 0.2, 0.1],
+        [0.2, 0.3, 0.2, 0.1, 0.2],
+        [0.25, 0.15, 0.2, 0.2, 0.2],
+    ],
+    dtype=np.float32,
+)
+apply_mesh_skin_weights(
+    mesh_object.name,
+    split_names,
+    skin_before_collapse,
+)
+
+# Collapse must update every mesh driven by the Armature. The accessory uses
+# pre-existing deform groups without an ownership manifest to verify that its
+# source weights are merged instead of silently discarded.
+accessory_data = bpy.data.meshes.new("UndoSmokeAccessory")
+accessory_data.from_pydata(
+    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+    [],
+    [(0, 1, 2)],
+)
+accessory_object = bpy.data.objects.new("UndoSmokeAccessory", accessory_data)
+bpy.context.scene.collection.objects.link(accessory_object)
+accessory_modifier = accessory_object.modifiers.new("Armature", "ARMATURE")
+accessory_modifier.object = armature_object
+accessory_root = accessory_object.vertex_groups.new(name="root")
+accessory_root_split = accessory_object.vertex_groups.new(name="root_split")
+accessory_root.add([0, 1, 2], 0.2, "REPLACE")
+accessory_root_split.add([0, 1, 2], 0.3, "REPLACE")
+accessory_source_weights = [
+    accessory_root_split.weight(vertex_index)
+    for vertex_index in range(len(accessory_object.data.vertices))
+]
+assert all(
+    abs(weight - 0.3) < 1e-6 for weight in accessory_source_weights
+), accessory_source_weights
+
+session.skin_generated = True
+assert mesh_object.vertex_groups.get("spine_99") is None
+assert mesh_object.vertex_groups.get("artist_mask") is not None
 dissolved = core.delete_selected_bone(session.blender_session_id)
 assert dissolved["ok"]
 assert dissolved["deleted_bone_name"] == "root_split"
 assert dissolved["delete_operation"] == "dissolve"
+assert dissolved["weight_target_name"] == "root"
+assert dissolved["weights_transferred"]
+assert dissolved["skin_invalidated"]
+assert not session.skin_generated
 assert dissolved["context"]["joint_names"] == CONTEXT["joint_names"]
 assert dissolved["context"]["parents"] == CONTEXT["parents"]
 assert armature_object.data.edit_bones["branch"].parent.name == "root"
 assert armature_object.data.edit_bones["sibling"].parent.name == "root"
+assert mesh_object.vertex_groups.get("root_split") is None
+assert accessory_object.vertex_groups.get("root_split") is None
+accessory_root_after_collapse = accessory_object.vertex_groups["root"]
+accessory_weights = [
+    accessory_root_after_collapse.weight(vertex_index)
+    for vertex_index in range(len(accessory_object.data.vertices))
+]
+assert all(abs(weight - 0.5) < 1e-6 for weight in accessory_weights), (
+    accessory_weights
+)
+assert managed_vertex_group_names(accessory_object, armature_object) == {"root"}
+assert managed_vertex_group_names(mesh_object, armature_object) == set(
+    CONTEXT["joint_names"]
+)
+root_group_after_collapse = mesh_object.vertex_groups["root"]
+for vertex_index, expected in enumerate(
+    skin_before_collapse[:, 0] + skin_before_collapse[:, 1]
+):
+    assert abs(root_group_after_collapse.weight(vertex_index) - float(expected)) < 1e-6
+
+# A subsequent Skin replaces exactly the recorded deform groups.
+skin_before_leaf_delete = np.asarray(
+    [
+        [0.4, 0.2, 0.3, 0.1],
+        [0.1, 0.4, 0.2, 0.3],
+        [0.25, 0.25, 0.25, 0.25],
+    ],
+    dtype=np.float32,
+)
+apply_mesh_skin_weights(
+    mesh_object.name,
+    CONTEXT["joint_names"],
+    skin_before_leaf_delete,
+)
+session.skin_generated = True
+assert mesh_object.vertex_groups.get("spine_99") is None
+assert mesh_object.vertex_groups.get("artist_mask") is not None
+assert managed_vertex_group_names(mesh_object, armature_object) == set(
+    CONTEXT["joint_names"]
+)
 
 for edit_bone in armature_object.data.edit_bones:
     edit_bone.select = False
@@ -345,7 +453,23 @@ deleted_leaf = core.delete_selected_bone(session.blender_session_id)
 assert deleted_leaf["ok"]
 assert deleted_leaf["deleted_bone_name"] == "leaf"
 assert deleted_leaf["delete_operation"] == "delete"
+assert deleted_leaf["weight_target_name"] == "branch"
+assert deleted_leaf["weights_transferred"]
+assert deleted_leaf["skin_invalidated"]
+assert not session.skin_generated
 assert "leaf" not in deleted_leaf["context"]["joint_names"]
+assert mesh_object.vertex_groups.get("leaf") is None
+assert mesh_object.vertex_groups.get("artist_mask") is not None
+assert managed_vertex_group_names(mesh_object, armature_object) == {
+    "root",
+    "branch",
+    "sibling",
+}
+branch_group = mesh_object.vertex_groups["branch"]
+for vertex_index, expected in enumerate(
+    skin_before_leaf_delete[:, 1] + skin_before_leaf_delete[:, 2]
+):
+    assert abs(branch_group.weight(vertex_index) - float(expected)) < 1e-6
 
 bpy.ops.object.mode_set(mode="OBJECT")
 session.context = dict(CONTEXT)
@@ -409,8 +533,10 @@ bpy.ops.ed.undo()
 addon._HISTORY_SYNC_DEADLINE = 0.0
 flush_timer(addon._flush_history_sync)
 assert bpy.context.mode == "POSE", bpy.context.mode
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
 
 bpy.ops.object.mode_set(mode="OBJECT")
+assert addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
 finished_scene = bpy.context.scene
 finished_armature = bpy.data.objects.get(session.armature_object_name)
 assert finished_armature is not None
@@ -420,10 +546,13 @@ mesh_object["skintokens_blender_session_id"] = session.blender_session_id
 mesh_object["skintokens_model_session_id"] = session.model_session_id
 mesh_object["skintokens_source_obj"] = str(session.obj_path)
 mesh_object["skintokens_source_armature"] = finished_armature.name
-root_group = mesh_object.vertex_groups.get("root")
-if root_group is None:
-    root_group = mesh_object.vertex_groups.new(name="root")
-root_group.add([0, 1, 2], 1.0, "REPLACE")
+finish_skin = np.zeros((len(mesh_object.data.vertices), len(CONTEXT["joint_names"])))
+finish_skin[:, 0] = 1.0
+apply_mesh_skin_weights(
+    mesh_object.name,
+    CONTEXT["joint_names"],
+    finish_skin,
+)
 session.skin_generated = True
 session.blender_to_obj_text = np.asarray(
     [
@@ -545,6 +674,9 @@ assert bpy.data.objects.get(mesh_object.name) is mesh_object
 assert bpy.data.objects.get(finished_armature.name) is finished_armature
 assert not bpy.app.timers.is_registered(addon._flush_history_sync)
 assert not addon.has_started_session(bpy.context)
+assert finished_armature[addon.POSTPROCESS_READY_PROP]
+assert not addon.SKINTOKENS_OT_semantic_rename.poll(bpy.context)
+assert not addon.SKINTOKENS_OT_mirror_align.poll(bpy.context)
 saved_output.unlink()
 addon.unregister()
 print("SKINTOKENS_UNDO_SMOKE_OK")

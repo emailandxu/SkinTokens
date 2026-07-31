@@ -96,7 +96,7 @@ generate the signed-size/hash index:
 blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
-cp dist/h3d_skintokens-1.0.7.zip \
+cp dist/h3d_skintokens-1.0.8.zip \
   .runtime/blender_extensions/
 blender --command extension server-generate \
   --repo-dir .runtime/blender_extensions
@@ -179,7 +179,7 @@ blender --command extension build \
   --source-dir interactive/blender \
   --output-dir dist
 blender --command extension validate \
-  dist/h3d_skintokens-1.0.7.zip
+  dist/h3d_skintokens-1.0.8.zip
 ```
 
 Install the ZIP with `Preferences > Extensions > Install from Disk`. Enable

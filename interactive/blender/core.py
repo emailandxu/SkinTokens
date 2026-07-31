@@ -18,13 +18,17 @@ from .apply_skin import (
     armature_by_name,
     armature_for_mesh,
     capture_armature_bone_states,
+    capture_vertex_group_weights,
     ensure_mesh_armature,
     import_skin_output,
+    mesh_object_names_for_armature,
     parse_armature_object,
     parse_mesh_armature,
     parse_rig_txt,
     read_mesh_skin_weights,
     selected_skin_bone_names,
+    transfer_managed_vertex_group_weights,
+    validate_vertex_group_transfer,
     write_mesh_skin_txt,
 )
 from .client import model_request
@@ -1117,11 +1121,25 @@ class BlenderInteractiveCore:
             )
             operation = "delete"
         removed_name = names[removed]
+        weight_target_name = (
+            None
+            if replacement_parent == -1
+            else names[replacement_parent]
+        )
         reparented_names = [
             names[index]
             for index, parent in enumerate(parents)
             if parent == removed
         ]
+        weight_mesh_names = list(
+            mesh_object_names_for_armature(session.armature_object_name)
+        )
+        if (
+            session.mesh_object_name
+            and session.mesh_object_name not in weight_mesh_names
+        ):
+            weight_mesh_names.append(session.mesh_object_name)
+        validate_vertex_group_transfer(weight_mesh_names, removed_name)
         keep = [index for index in range(len(joints)) if index != removed]
         old_to_new = {old: new for new, old in enumerate(keep)}
         new_parents = []
@@ -1149,6 +1167,8 @@ class BlenderInteractiveCore:
             "select_name": select_name,
             "mode_after": self._result_mode(session),
             "deleted_bone_name": removed_name,
+            "weight_target_name": weight_target_name,
+            "weight_mesh_names": weight_mesh_names,
             "delete_operation": operation,
             "reparented_names": reparented_names,
             "remote": self.prepare_session_request(session, payload),
@@ -1161,6 +1181,14 @@ class BlenderInteractiveCore:
         session = self.sessions.get(blender_session_id)
         if session is None:
             return {"ok": False, "code": "STALE_RESULT", "error": "session ended"}
+        weight_mesh_names = [str(name) for name in prepared["weight_mesh_names"]]
+        weight_snapshots = {
+            mesh_name: capture_vertex_group_weights(
+                mesh_name,
+                str(prepared["deleted_bone_name"]),
+            )
+            for mesh_name in weight_mesh_names
+        }
         self._apply_context_to_armature(
             session,
             response["context"],
@@ -1171,6 +1199,18 @@ class BlenderInteractiveCore:
             allow_reparent_names=set(prepared["reparented_names"]),
         )
         session.context = response["context"]
+        transfer_results = [
+            transfer_managed_vertex_group_weights(
+                mesh_name,
+                str(prepared["deleted_bone_name"]),
+                prepared.get("weight_target_name"),
+                snapshot=weight_snapshots[mesh_name],
+            )
+            for mesh_name in weight_mesh_names
+        ]
+        weights_transferred = any(transfer_results)
+        skin_invalidated = bool(session.skin_generated)
+        session.skin_generated = False
         self._clear_vae_state(session)
         return {
             "ok": True,
@@ -1179,6 +1219,10 @@ class BlenderInteractiveCore:
             "mesh_object_name": session.mesh_object_name,
             "context": session.context,
             "deleted_bone_name": str(prepared["deleted_bone_name"]),
+            "weight_target_name": prepared.get("weight_target_name"),
+            "weight_mesh_names": weight_mesh_names,
+            "weights_transferred": weights_transferred,
+            "skin_invalidated": skin_invalidated,
             "delete_operation": str(prepared["delete_operation"]),
         }
 
